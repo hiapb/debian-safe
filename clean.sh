@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ======================================================================
-# 🚀 Nuro Deep Clean • Safe-Deep++ (修复swap占用 + 更深清理 + BT友好)
+# 🚀 Nuro Deep Clean • Safe-Deep++ v2
+# 重点：备份 & 用户 Downloads 目录 —— 全量删除（不限大小）
+# 其他：深度清理 CPU/内存/硬盘 + 智能 Swap + BT/站点/DB/PHP 强保护 + 美观输出
 # ======================================================================
 
 set -e
@@ -24,14 +26,13 @@ log(){ printf "${C_CYAN}•${C_RESET} %s\n" "$*"; }
 
 trap 'err "出错：行 $LINENO"; exit 1' ERR
 
-# ======= 强保护：绝不触碰 =======
+# ======= 强保护：绝不触碰（BT/站点/DB/PHP） =======
 EXCLUDES=(
   "/www/server/panel" "/www/wwwlogs" "/www/wwwroot"
   "/www/server/nginx" "/www/server/apache" "/www/server/openresty"
   "/www/server/mysql" "/var/lib/mysql" "/var/lib/mariadb" "/var/lib/postgresql"
   "/www/server/php" "/etc/php" "/var/lib/php/sessions"
 )
-
 is_excluded(){ local p="$1"; for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e"* ]] && return 0; done; return 1; }
 
 # ======= 基本信息 =======
@@ -41,18 +42,17 @@ log "磁盘占用（根分区）："; df -h / | sed 's/^/  /'
 log "内存占用："; free -h | sed 's/^/  /'
 ok "概况完成"
 
-# ======= 进程与锁：仅APT相关 =======
+# ======= 进程与锁（仅 APT 相关） =======
 title "进程与锁" "清理 apt/dpkg 残留锁"
 pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
 rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
 dpkg --configure -a >/dev/null 2>&1 || true
 ok "apt/dpkg 锁处理完成"
 
-# ======= 日志：1天保留，结构保留 =======
+# ======= 日志：保留 1 天，保结构 =======
 title "日志清理" "journal + 常规日志"
 journalctl --rotate || true
 journalctl --vacuum-time=1d --vacuum-size=64M >/dev/null 2>&1 || true
-# 常规日志截断（不删文件/权限）
 find /var/log -type f \
   -not -path "/www/server/panel/logs/*" -not -path "/www/wwwlogs/*" \
   -exec truncate -s 0 {} \; 2>/dev/null || true
@@ -62,8 +62,8 @@ find /var/log -type f \
 : > /var/log/faillog || true
 ok "日志清理完成"
 
-# ======= 临时/缓存 =======
-title "临时与缓存" "/tmp /var/tmp /var/cache（排除PHP会话等）"
+# ======= 临时/缓存（排除 PHP 会话等） =======
+title "临时与缓存" "/tmp /var/tmp /var/cache"
 find /tmp -xdev -type f -atime +1 -not -name 'sess_*' -delete 2>/dev/null || true
 find /var/tmp -xdev -type f -atime +1 -delete 2>/dev/null || true
 find /tmp -xdev -type f -size +50M -not -name 'sess_*' -delete 2>/dev/null || true
@@ -103,11 +103,36 @@ fi
 command -v ctr >/dev/null 2>&1 && ctr -n k8s.io images prune >/dev/null 2>&1 || true
 ok "容器清理完成"
 
-# ======= 大文件与备份 =======
-title "大文件与备份" "安全路径 >100MB 清理 + 压缩包"
-rm -rf /www/server/backup/* 2>/dev/null || true
-rm -rf /root/Downloads/* /home/*/Downloads/* 2>/dev/null || true
+# ======= ⭐ 备份 & 用户 Downloads —— 全量删除（不限大小） =======
+title "备份与用户下载" "不设大小阈值，直接清空"
+# 1) 宝塔备份目录：全部清空
+if [[ -d /www/server/backup ]]; then
+  log "清空 /www/server/backup/ （备份目录）"
+  rm -rf /www/server/backup/* 2>/dev/null || true
+fi
+# 2) 所有用户 Downloads：全部清空（root 与 /home/*）
+if [[ -d /root/Downloads ]]; then
+  log "清空 /root/Downloads/"
+  rm -rf /root/Downloads/* 2>/dev/null || true
+fi
+for d in /home/*/Downloads; do
+  [[ -d "$d" ]] || continue
+  log "清空 $d"
+  rm -rf "$d"/* 2>/dev/null || true
+done
+# 3) 用户家目录中的常见备份/压缩包：不限大小清理（仅限 /root 与 /home/*）
+for base in /root /home/*; do
+  [[ -d "$base" ]] || continue
+  find "$base" -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.bak" -o -name "*.rar" -o -name "*.7z" \) \
+    -print0 2>/dev/null | while IFS= read -r -d '' f; do
+      is_excluded "$f" && continue
+      rm -f "$f" 2>/dev/null || true
+    done
+done
+ok "备份 & 用户下载 —— 已全部清空"
 
+# ======= 其他大文件（安全路径） >100MB（继续保留这一项，用于扫漏） =======
+title "大文件补充清理" "安全路径 >100MB"
 SAFE_BASES=(/tmp /var/tmp /var/cache /var/backups /root /home /www/server/backup)
 for base in "${SAFE_BASES[@]}"; do
   [[ -d "$base" ]] || continue
@@ -116,13 +141,9 @@ for base in "${SAFE_BASES[@]}"; do
     rm -f "$f" 2>/dev/null || true
   done < <(find "$base" -xdev -type f -size +100M -print0 2>/dev/null)
 done
-while IFS= read -r -d '' f; do
-  is_excluded "$f" && continue
-  rm -f "$f" 2>/dev/null || true
-done < <(find / -xdev -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.bak' \) -size +100M -print0 2>/dev/null)
-ok "大文件与备份清理完成"
+ok "大文件补充清理完成"
 
-# ======= 内核（保留当前+最新） =======
+# ======= 旧内核（保留当前+最新） =======
 title "旧内核清理" "仅移除非当前且非最新的"
 if command -v dpkg >/dev/null 2>&1; then
   CURK="$(uname -r)"
@@ -136,16 +157,12 @@ if command -v dpkg >/dev/null 2>&1; then
 fi
 ok "内核清理完成"
 
-# ======= 内存/CPU 深度：释放缓存+紧凑 =======
-title "内存/CPU 优化" "drop_caches + compact_memory"
+# ======= 内存/CPU 深度优化 + 智能 Swap（处理 btrfs/COW/占用） =======
+title "内存/CPU 优化" "drop_caches + compact + 智能 Swap"
 sync
 echo 3 > /proc/sys/vm/drop_caches || true
 [[ -w /proc/sys/vm/compact_memory ]] && echo 1 > /proc/sys/vm/compact_memory || true
-ok "内存释放完成"
 
-# ======= 智能 Swap（修复 Text file busy） =======
-title "Swap 优化" "智能容量 + 兼容 btrfs + 修复占用"
-# 计算目标容量（物理内存一半，min 256MiB，max 2048MiB，且不吃光磁盘）
 calc_target_mib(){
   local mem_mib avail_mib target maxsafe
   mem_mib=$(awk '/MemTotal/ {printf "%.0f",$2/1024}' /proc/meminfo)
@@ -157,33 +174,23 @@ calc_target_mib(){
   (( target > maxsafe )) && target=$maxsafe
   echo "$target"
 }
-
-# 如果已有 /swapfile：优雅下线→解除占用→移除不可变→重建
 prepare_swapfile_path(){
   if [[ -e /swapfile ]]; then
-    log "检测到已有 /swapfile，尝试下线并替换..."
-    # 如果在用，先下线
     grep -q '^/swapfile' /proc/swaps 2>/dev/null && swapoff /swapfile || true
     swapoff -a || true
-    # 结束占用 /swapfile 的进程（极少见）
     command -v fuser >/dev/null 2>&1 && fuser -km /swapfile 2>/dev/null || true
-    # 移除不可变属性（某些环境会被 chattr +i）
     command -v chattr >/dev/null 2>&1 && chattr -i /swapfile 2>/dev/null || true
     rm -f /swapfile || true
   fi
 }
-
 create_swapfile(){
   local target="$1"
   [[ -z "${target}" || "${target}" -lt 128 ]] && { warn "磁盘空间不足，放弃新建 swap"; return 0; }
-  # btrfs 上需要关闭 COW
-  local root_fs
-  root_fs=$(stat -f -c %T / 2>/dev/null || echo "")
+  local root_fs; root_fs=$(stat -f -c %T / 2>/dev/null || echo "")
   if [[ "$root_fs" == "btrfs" ]]; then
-    log "检测到 btrfs，关闭 COW 再创建 swapfile"
+    log "btrfs：关闭 COW 后创建 swapfile"
     touch /swapfile && chattr +C /swapfile 2>/dev/null || true
   fi
-  # 先尝试 fallocate，失败再 dd
   if ! fallocate -l ${target}M /swapfile 2>/dev/null; then
     log "fallocate 失败，改用 dd"
     dd if=/dev/zero of=/swapfile bs=1M count=${target} status=none conv=fsync
@@ -194,9 +201,8 @@ create_swapfile(){
   grep -q '^/swapfile' /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab
   ok "Swap 已创建/启用：${target}MiB"
 }
-
 if grep -q ' swap ' /proc/swaps 2>/dev/null; then
-  log "已有 swap，执行重建以刷新"
+  log "已有 swap，执行重建"
   swapoff -a || true
   swapon -a  || true
   ok "Swap 重建完成"
@@ -210,7 +216,7 @@ else
   fi
 fi
 
-# ======= SSD TRIM =======
+# ======= 磁盘 TRIM =======
 title "磁盘优化" "fstrim（若可用）"
 if command -v fstrim >/dev/null 2>&1; then
   fstrim -av >/dev/null 2>&1 || true
@@ -219,13 +225,12 @@ else
   warn "未检测到 fstrim"
 fi
 
-# ======= 汇总 =======
+# ======= 汇总 & 定时任务 =======
 title "完成汇总" "当前资源状态"
 df -h / | sed 's/^/  /'
 free -h | sed 's/^/  /'
-ok "深度清理全部完成 🎉"
+ok "深度清理完成 🎉"
 
-# ======= 定时任务 =======
 title "计划任务" "写入 crontab (每日 03:00)"
 chmod +x /root/deep-clean.sh
 ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true; echo "0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1" ) | crontab -u root -
