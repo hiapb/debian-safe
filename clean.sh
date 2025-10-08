@@ -18,7 +18,7 @@ if [ ! -f "$SCRIPT_PATH" ]; then
 set -e
 echo -e "\n🧹 [Nuro Deep Clean] 开始深度清理...\n"
 
-# 1. 系统信息
+# 1. 系统信息 
 echo "系统信息："
 uname -a
 echo "磁盘占用前："
