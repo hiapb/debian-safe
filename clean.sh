@@ -83,12 +83,23 @@ fi
 # 10. 自动设置定时任务（每天凌晨3点）
 # ========================
 echo "设置自动清理任务（每天凌晨 3 点执行）..."
-CRON_JOB="0 3 * * * bash /root/deep-clean.sh >/dev/null 2>&1"
-( crontab -l 2>/dev/null | grep -v 'deep-clean.sh' ; echo "$CRON_JOB" ) | crontab -
+CRON_JOB="0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1"
+( sudo crontab -l -u root 2>/dev/null | grep -v 'deep-clean.sh' ; echo "$CRON_JOB" ) | sudo crontab -u root -
 
 # ========================
-# 11. 完成
+# 11. 立即释放缓存
 # ========================
+echo "释放系统缓存..."
+sync
+echo 3 > /proc/sys/vm/drop_caches
+
+# ========================
+# 12. 完成
+# ========================
+echo -e "\n✅ 深度清理完成！"
+df -h /
+free -h
+echo -e "\n🕒 已添加每日 3:00 自动执行任务，可用命令查看：sudo crontab -l -u root"
 echo -e "\n✅ 深度清理完成！"
 echo "磁盘占用后："
 df -h /
