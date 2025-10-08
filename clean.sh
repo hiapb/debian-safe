@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ======================================================================
-# 🌙 Nuro Deep Clean • Minimal-Extreme
-# 目标：系统极简深度瘦身；不触碰宝塔/站点/数据库/PHP；SSH 尽量不受影响
+# 🌙 Nuro Deep Clean • Ultra-Min Server Trim (Debian/Ubuntu & AlmaLinux)
+# 目标：在不影响 BT/站点/DB/PHP/SSH 的前提下，尽可能“系统极简 + 深度清理”
 # ======================================================================
 
 set -e
@@ -23,7 +23,7 @@ err(){ printf "${RED}✘${C0} %s\n" "$*"; }
 log(){ printf "${CYA}•${C0} %s\n" "$*"; }
 trap 'err "出错：行 $LINENO"; exit 1' ERR
 
-# ====== 强保护路径（绝不触碰）======
+# ====== 保护路径（绝不触碰）======
 EXCLUDES=(
   "/www/server/panel" "/www/wwwlogs" "/www/wwwroot"
   "/www/server/nginx" "/www/server/apache" "/www/server/openresty"
@@ -32,8 +32,34 @@ EXCLUDES=(
 )
 is_excluded(){ local p="$1"; for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e"* ]] && return 0; done; return 1; }
 
-# ====== 降优先级执行（避免卡顿）======
+# ====== 工具与平台识别 ======
+PKG=""; HAS_APT=0; HAS_DNF=0
+if command -v apt-get >/dev/null 2>&1; then PKG="apt"; HAS_APT=1; fi
+if command -v dnf >/devnull 2>&1 || command -v dnf >/dev/null 2>&1; then PKG="dnf"; HAS_DNF=1; fi
+if [[ $HAS_DNF -eq 0 && $HAS_APT -eq 0 && command -v yum >/dev/null 2>&1 ]]; then PKG="yum"; HAS_DNF=1; fi
+
+is_vm(){ command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; } # 0=是虚机
+
+# 通用低优先级执行
 NI(){ nice -n 19 ionice -c3 bash -c "$*"; }
+
+# 包是否存在
+dpkg_has(){ dpkg -s "$1" >/dev/null 2>&1; }
+rpm_has(){ rpm -q "$1" >/dev/null 2>&1; }
+
+# 安全卸载（按发行版）
+pkg_purge(){
+  local p; for p in "$@"; do
+    case "$PKG" in
+      apt)
+        dpkg_has "$p" && apt-get -y purge "$p" >/dev/null 2>&1 || true
+        ;;
+      dnf|yum)
+        rpm_has "$p" && (dnf -y remove "$p" >/dev/null 2>&1 || yum -y remove "$p" >/dev/null 2>&1) || true
+        ;;
+    esac
+  done
+}
 
 # ====== 概况 ======
 title "🌍 系统概况" "系统信息与资源概览"
@@ -42,23 +68,22 @@ log "磁盘占用（根分区）："; df -h / | sed 's/^/  /'
 log "内存占用："; free -h | sed 's/^/  /'
 ok "概况完成"
 
-# ====== 进程与锁（只处理 APT）======
-title "🔒 进程清理" "释放 APT/Dpkg 锁"
-pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
-rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
-dpkg --configure -a >/dev/null 2>&1 || true
-ok "apt/dpkg 锁处理完成"
+# ====== APT/Dpkg 锁处理（Deb/Ub）======
+if [[ $HAS_APT -eq 1 ]]; then
+  title "🔒 进程清理" "释放 APT/Dpkg 锁"
+  pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
+  rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
+  dpkg --configure -a >/dev/null 2>&1 || true
+  ok "apt/dpkg 锁处理完成"
+fi
 
-# ====== 日志（保 1 天，保结构）======
+# ====== 日志清理（保 1 天，保结构）======
 title "🧾 日志清理" "清空旧日志 保留结构"
 journalctl --rotate || true
 journalctl --vacuum-time=1d --vacuum-size=64M >/dev/null 2>&1 || true
 NI "find /var/log -type f \( -name '*.log' -o -name '*.old' -o -name '*.gz' -o -name '*.1' \) \
   -not -path '/www/server/panel/logs/*' -not -path '/www/wwwlogs/*' -exec truncate -s 0 {} + 2>/dev/null || true"
-: > /var/log/wtmp  || true
-: > /var/log/btmp  || true
-: > /var/log/lastlog || true
-: > /var/log/faillog || true
+: > /var/log/wtmp  || true; : > /var/log/btmp  || true; : > /var/log/lastlog || true; : > /var/log/faillog || true
 ok "日志清理完成"
 
 # ====== 临时/缓存（更深）======
@@ -74,54 +99,101 @@ rm -rf /var/lib/nginx/tmp/* /var/lib/nginx/body/* /var/lib/nginx/proxy/* 2>/dev/
 rm -rf /var/tmp/nginx/* /var/cache/nginx/* 2>/dev/null || true
 ok "临时/缓存清理完成"
 
-# ====== 包管理缓存（深度）======
-title "📦 包缓存" "APT 历史/Snap 全清/语言缓存"
-# 停止 APT 定时器，释放锁
-systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
-rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock 2>/dev/null || true
-dpkg --configure -a >/dev/null 2>&1 || true
-# APT 深度清理
-apt-get -y autoremove --purge  >/dev/null 2>&1 || true
-apt-get -y autoclean           >/dev/null 2>&1 || true
-apt-get -y clean               >/dev/null 2>&1 || true
-dpkg -l 2>/dev/null | awk '/^rc/{print $2}' | xargs -r dpkg -P >/dev/null 2>&1 || true
-rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/cache/apt/archives/partial 2>/dev/null || true
-# 移除非当前内核 headers/modules-extra
-CURK="$(uname -r)"
-dpkg -l | awk '/^ii\s+linux-(headers|modules-extra)-/{print $2}' | grep -v "$CURK" \
-  | xargs -r apt-get -y purge >/dev/null 2>&1 || true
-# Snap：卸载全部应用并彻底移除 snapd（极简）
+# ====== 包缓存 & 历史清理（跨发行版）======
+title "📦 包缓存" "APT/DNF 历史与缓存深度清理"
+if [[ $HAS_APT -eq 1 ]]; then
+  systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  apt-get -y autoremove --purge  >/dev/null 2>&1 || true
+  apt-get -y autoclean           >/dev/null 2>&1 || true
+  apt-get -y clean               >/dev/null 2>&1 || true
+  dpkg -l 2>/dev/null | awk '/^rc/{print $2}' | xargs -r dpkg -P >/dev/null 2>&1 || true
+  rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/cache/apt/archives/partial 2>/dev/null || true
+  # 非当前 headers/modules-extra
+  CURK="$(uname -r)"
+  dpkg -l | awk '/^ii\s+linux-(headers|modules-extra)-/{print $2}' | grep -v "$CURK" \
+    | xargs -r apt-get -y purge >/dev/null 2>&1 || true
+fi
+if [[ $HAS_DNF -eq 1 ]]; then
+  # dnf/yum 清理与自动移除未用依赖
+  (dnf -y autoremove >/dev/null 2>&1 || yum -y autoremove >/dev/null 2>&1 || true)
+  (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/dev/null 2>&1 || true)
+  rm -rf /var/cache/dnf/* /var/cache/yum/* 2>/dev/null || true
+  # 移除 rescue 内核镜像（不影响当前可启动项）
+  pkg_purge dracut-config-rescue >/dev/null 2>&1 || true
+fi
+ok "包缓存/历史清理完成"
+
+# ====== 组件裁剪：跨发行版常见“非必需”组件 ======
+title "✂️ 组件裁剪" "移除非必需工具包（服务器极简）"
+if [[ $HAS_APT -eq 1 ]]; then
+  # Ubuntu/Debian
+  pkg_purge snapd cloud-init apport whoopsie popularity-contest \
+            landscape-client ubuntu-advantage-tools update-notifier unattended-upgrades
+  # Cockpit/桌面碎件（若装了）
+  pkg_purge cockpit cockpit-ws cockpit-system \
+            avahi-daemon cups* modemmanager network-manager* plymouth* fwupd* \
+            printer-driver-* xserver-xorg* x11-* wayland* *-doc
+fi
+if [[ $HAS_DNF -eq 1 ]]; then
+  # AlmaLinux / RHEL 系
+  pkg_purge cloud-init subscription-manager insights-client \
+            cockpit cockpit-ws cockpit-system \
+            abrt* sos* avahi* cups* modemmanager NetworkManager* plymouth* fwupd* \
+            man-db man-pages groff-base texinfo
+  # cloud/订阅/遥测/问题诊断/桌面相关大多对纯服务器没必要
+fi
+ok "组件裁剪完成"
+
+# ====== Snap 全清（若存在，跨发行版兜底）======
+title "🧨 Snap 移除" "彻底移除 snapd 生态"
 if command -v snap >/dev/null 2>&1; then
-  snap list 2>/dev/null | sed '1d' | awk '{print $1}' | while read -r app; do snap remove "$app" >/dev/null 2>&1 || true; done
+  snap list 2>/dev/null | sed '1d' | awk '{print $1}' \
+    | while read -r app; do snap remove "$app" >/dev/null 2>&1 || true; done
 fi
 systemctl stop snapd.service snapd.socket 2>/dev/null || true
 umount /snap 2>/dev/null || true
-apt-get -y purge snapd >/dev/null 2>&1 || true
+pkg_purge snapd
 rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd 2>/dev/null || true
-# 语言生态缓存
-command -v pip >/dev/null      && pip cache purge >/dev/null 2>&1 || true
-command -v npm >/dev/null      && npm cache clean --force >/dev/null 2>&1 || true
-command -v yarn >/dev/null     && yarn cache clean >/dev/null 2>&1 || true
-command -v pnpm >/dev/null     && pnpm store prune >/dev/null 2>&1 || true
-command -v composer >/dev/null && composer clear-cache >/dev/null 2>&1 || true
-command -v gem >/dev/null      && gem cleanup -q >/dev/null 2>&1 || true
-# 多用户语言缓存目录
-clean_user_caches(){ local base="$1"; [ -d "$base" ] || return 0; rm -rf \
-  "$base/.cache/pip" \
-  "$base/.npm/_cacache" "$base/.npm/_logs" \
-  "$base/.cache/yarn" "$base/.config/yarn" \
-  "$base/.cache/pnpm" \
-  "$base/.composer/cache" \
-  "$base/.cache"/* 2>/dev/null || true; }
-clean_user_caches /root; for u in /home/*; do [ -d "$u" ] && clean_user_caches "$u"; done
-ok "包管理缓存清理完成"
+ok "Snap 生态清理完成"
 
-# ====== 备份 & 用户 Downloads —— 全量删除（不限大小）======
+# ====== 文档/本地化/开发静态库 瘦身 ======
+title "🧽 系统瘦身" "文档/本地化/静态库/pyc"
+# 文档（节省上百MB）
+rm -rf /usr/share/man/* /usr/share/info/* /usr/share/doc/* 2>/dev/null || true
+# locale：仅保留 en*/zh*
+if [[ -d /usr/share/locale ]]; then
+  find /usr/share/locale -mindepth 1 -maxdepth 1 -type d \
+    | grep -Ev '^(.*\/)?(en|zh)' | xargs -r rm -rf 2>/dev/null || true
+fi
+if [[ -d /usr/lib/locale ]]; then
+  ls /usr/lib/locale 2>/dev/null | grep -Ev '^(en|zh)' \
+    | xargs -r -I{} rm -rf "/usr/lib/locale/{}" 2>/dev/null || true
+fi
+# Python 字节码与缓存
+NI "find / -xdev -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true"
+NI "find / -xdev -type f -name '*.pyc' -delete 2>/dev/null || true"
+# 开发静态库（运行期一般无用）
+NI "find /usr/lib /usr/lib64 /lib /lib64 -type f \( -name '*.a' -o -name '*.la' \) -delete 2>/dev/null || true"
+ok "系统瘦身完成"
+
+# ====== 云/固件裁剪（仅云虚机才移除 firmware）======
+title "☁️ 虚机裁剪" "在虚机上移除 linux-firmware（物理机保留）"
+if is_vm; then
+  case "$PKG" in
+    apt)  pkg_purge linux-firmware ;;
+    dnf|yum) pkg_purge linux-firmware ;;
+  esac
+  rm -rf /lib/firmware/* 2>/dev/null || true
+  ok "已在虚机裁剪 firmware（物理机保留）"
+else
+  warn "检测为物理机或未知虚拟化，保留 firmware 以免驱动缺失"
+fi
+
+# ====== 备份 & 用户下载清理 ======
 title "🗄️ 备份清理" "移除系统与用户备份/下载"
 [[ -d /www/server/backup ]] && NI "rm -rf /www/server/backup/* 2>/dev/null || true"
 [[ -d /root/Downloads    ]] && NI "rm -rf /root/Downloads/* 2>/dev/null || true"
 for d in /home/*/Downloads; do [[ -d "$d" ]] && NI "rm -rf '$d'/* 2>/dev/null || true"; done
-# 家目录常见压缩/备份包
 for base in /root /home/*; do
   [[ -d "$base" ]] || continue
   NI "find '$base' -type f \( -name '*.zip' -o -name '*.tar' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.rar' -o -name '*.7z' -o -name '*.bak' \) -delete 2>/dev/null || true"
@@ -142,7 +214,7 @@ ok "大文件补充清理完成"
 
 # ====== 旧内核（保留当前+最新）======
 title "🧰 内核清理" "仅保留当前与最新版本"
-if command -v dpkg >/dev/null 2>&1; then
+if [[ $HAS_APT -eq 1 ]]; then
   CURK="$(uname -r)"
   mapfile -t KS < <(dpkg -l | awk '/linux-image-[0-9]/{print $2}' | sort -V)
   KEEP=("linux-image-${CURK}")
@@ -151,33 +223,13 @@ if command -v dpkg >/dev/null 2>&1; then
   PURGE=(); for k in "${KS[@]}"; do [[ " ${KEEP[*]} " == *" $k "* ]] || PURGE+=("$k"); done
   ((${#PURGE[@]})) && NI "apt-get -y purge ${PURGE[*]} >/dev/null 2>&1 || true"
 fi
+if [[ $HAS_DNF -eq 1 ]]; then
+  # 保留当前内核与最新一个，其余移除
+  CURK="$(uname -r | sed 's/\./\\./g')"
+  mapfile -t RMK < <(rpm -q kernel-core kernel | grep -vE "$CURK" | sort -V | head -n -1 || true)
+  ((${#RMK[@]})) && (dnf -y remove "${RMK[@]}" >/dev/null 2>&1 || yum -y remove "${RMK[@]}" >/dev/null 2>&1 || true)
+fi
 ok "内核清理完成"
-
-# ====== 系统瘦身（极限）======
-title "🧽 系统瘦身" "文档/本地化/静态库/pyc"
-# 删除 man/info/doc（节省上百 MB）
-rm -rf /usr/share/man/* /usr/share/info/* /usr/share/doc/* 2>/dev/null || true
-# 精简 locale：仅保留 en* / zh*
-if [[ -d /usr/share/locale ]]; then
-  find /usr/share/locale -mindepth 1 -maxdepth 1 -type d \
-    | grep -Ev '^(.*\/)?(en|zh)' | xargs -r rm -rf 2>/dev/null || true
-fi
-if [[ -d /usr/lib/locale ]]; then
-  ls /usr/lib/locale 2>/dev/null | grep -Ev '^(en|zh)' \
-    | xargs -r -I{} rm -rf "/usr/lib/locale/{}" 2>/dev/null || true
-fi
-# 移除 Python 字节码与缓存
-NI "find / -xdev -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true"
-NI "find / -xdev -type f -name '*.pyc' -delete 2>/dev/null || true"
-# 删除静态库 *.a/*.la（运行时通常不需要）
-NI "find /usr/lib /usr/lib64 /lib /lib64 -type f \( -name '*.a' -o -name '*.la' \) -delete 2>/dev/null || true"
-# 错误收集器/不必要组件
-apt-get -y purge apport whoopsie popularity-contest >/dev/null 2>&1 || true
-# cloud-init（极简：若你的系统依赖它注入网络/密钥，请勿使用本脚本）
-systemctl stop cloud-init.service 2>/dev/null || true
-apt-get -y purge cloud-init >/dev/null 2>&1 || true
-rm -rf /etc/cloud/ /var/lib/cloud/ 2>/dev/null || true
-ok "系统瘦身完成"
 
 # ====== 内存/CPU 优化（深度）======
 title "⚡ 内存优化" "低负载回收缓存"
@@ -196,7 +248,7 @@ else
   warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免卡顿/断连"
 fi
 
-# ===== Swap 管理（内存≥2G 禁用；<2G 保留单一 /swapfile）======
+# ====== Swap 策略（内存≥2G 禁用；<2G 单一 /swapfile）======
 title "💾 Swap 管理" "≥2G禁用；<2G 单一 /swapfile"
 calc_target_mib(){ local mem_kb mib target; mem_kb="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2)"; mib=$(( mem_kb/1024 )); target=$(( mib/2 )); (( target<256 ))&&target=256; (( target>2048 ))&&target=2048; echo "$target"; }
 active_swaps(){ swapon --show=NAME --noheadings 2>/dev/null | sed '/^$/d'; }
