@@ -36,21 +36,21 @@ is_excluded(){ local p="$1"; for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e"* ]] &
 NI(){ nice -n 19 ionice -c3 bash -c "$*"; }
 
 # ====== 概况 ======
-title "系统概况" "采集中"
+title "🌍 系统概况" "系统信息与资源概览"
 uname -a | sed 's/^/  /'
 log "磁盘占用（根分区）："; df -h / | sed 's/^/  /'
 log "内存占用："; free -h | sed 's/^/  /'
 ok "概况完成"
 
 # ====== 进程与锁（只处理 APT）======
-title "进程与锁" "清理 apt/dpkg 残留锁（不杀 web/db/php）"
+title "🔒 进程清理" "释放 APT/Dpkg 锁"
 pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
 rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
 dpkg --configure -a >/dev/null 2>&1 || true
 ok "apt/dpkg 锁处理完成"
 
 # ====== 日志（保 1 天，保结构）======
-title "日志清理" "journal + 常规日志（不删活动目录）"
+title "🧾 日志清理" "清空旧日志 保留结构"
 journalctl --rotate || true
 journalctl --vacuum-time=1d --vacuum-size=64M >/dev/null 2>&1 || true
 NI "find /var/log -type f -not -path '/www/server/panel/logs/*' -not -path '/www/wwwlogs/*' -exec truncate -s 0 {} + 2>/dev/null || true"
@@ -61,7 +61,7 @@ NI "find /var/log -type f -not -path '/www/server/panel/logs/*' -not -path '/www
 ok "日志清理完成"
 
 # ====== 临时/缓存（排除 PHP 会话）======
-title "临时与缓存" "/tmp /var/tmp /var/cache（安全）"
+title "🧹 缓存清理" "清理 /tmp /var/tmp 等"
 NI "find /tmp -xdev -type f -atime +1 -not -name 'sess_*' -delete 2>/dev/null || true"
 NI "find /var/tmp -xdev -type f -atime +1 -delete 2>/dev/null || true"
 NI "find /tmp -xdev -type f -size +50M -not -name 'sess_*' -delete 2>/dev/null || true"
@@ -71,7 +71,7 @@ rm -rf /var/crash/* /var/lib/systemd/coredump/* 2>/dev/null || true
 ok "临时/缓存清理完成"
 
 # ====== 包管理缓存 ======
-title "包管理缓存" "APT / Snap / 语言包"
+title "📦 包缓存" "APT / Snap / 语言缓存"
 if command -v apt-get >/dev/null 2>&1; then
   apt-get -y autoremove  >/dev/null 2>&1 || true
   apt-get -y autoclean   >/dev/null 2>&1 || true
@@ -89,7 +89,7 @@ command -v gem >/dev/null      && gem cleanup -q >/dev/null 2>&1 || true
 ok "包管理缓存清理完成"
 
 # ====== 容器清理（不动业务卷绑定）======
-title "容器清理" "Docker 构建缓存/镜像/卷/网络（低优先级）"
+title "🐳 容器清理" "Docker 残留安全删除"
 if command -v docker >/dev/null 2>&1; then
   NI "docker builder prune -af >/dev/null 2>&1 || true"
   NI "docker image prune   -af --filter 'until=168h' >/dev/null 2>&1 || true"
@@ -102,7 +102,7 @@ command -v ctr >/dev/null 2>&1 && NI "ctr -n k8s.io images prune >/dev/null 2>&1
 ok "容器清理完成"
 
 # ====== 备份 & 用户 Downloads —— 全量删除（不限大小）======
-title "备份与用户下载" "全部清空（保护站点/DB/PHP）"
+title "🗄️ 备份清理" "移除系统与用户备份"
 [[ -d /www/server/backup ]] && NI "rm -rf /www/server/backup/* 2>/dev/null || true"
 [[ -d /root/Downloads    ]] && NI "rm -rf /root/Downloads/* 2>/dev/null || true"
 for d in /home/*/Downloads; do [[ -d "$d" ]] && NI "rm -rf '$d'/* 2>/dev/null || true"; done
@@ -115,7 +115,7 @@ done
 ok "备份与用户下载清空完成"
 
 # ====== 大文件补充（安全路径 >100MB）======
-title "大文件补充清理" "安全路径 >100MB"
+title "🪣 大文件清理" "安全目录下清除 >100MB"
 SAFE_BASES=(/tmp /var/tmp /var/cache /var/backups /root /home /www/server/backup)
 for base in "${SAFE_BASES[@]}"; do
   [[ -d "$base" ]] || continue
@@ -127,7 +127,7 @@ done
 ok "大文件补充清理完成"
 
 # ====== 旧内核（保留当前+最新）======
-title "旧内核清理" "仅移除非当前且非最新"
+title "🧰 内核清理" "仅保留当前与最新版本"
 if command -v dpkg >/dev/null 2>&1; then
   CURK="$(uname -r)"
   mapfile -t KS < <(dpkg -l | awk '/linux-image-[0-9]/{print $2}' | sort -V)
@@ -140,7 +140,7 @@ fi
 ok "内核清理完成"
 
 # ====== 内存/CPU 优化（稳态）======
-title "内存/CPU 优化" "温和回收（不 swapoff、不杀进程）"
+title "⚡ 内存优化" "轻量回收 内存更流畅"
 # 仅在负载低 & 可用内存充足时做
 LOAD1=$(awk '{print int($1)}' /proc/loadavg)
 MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
@@ -160,7 +160,7 @@ else
 fi
 
 # ===== Swap 管理（单一：0->建1；1->不动；多->全关重建1） =====
-title "Swap 管理" "0->创建；1->保持；多->关闭全部并重建为单一 /swapfile"
+title "💾 Swap 管理" "智能检测并保持单一 Swap"
 
 # 计算目标大小：内存一半，范围 [256,2048] MiB
 calc_target_mib() {
@@ -289,15 +289,15 @@ log "当前活动 swap："
 ( swapon --show || echo "  (none)" ) | sed 's/^/  /'
 
 # ====== 磁盘 TRIM ======
-title "磁盘优化" "fstrim（若可用）"
+title "🪶 磁盘优化" "执行 fstrim 提升性能"
 if command -v fstrim >/dev/null 2>&1; then NI "fstrim -av >/dev/null 2>&1 || true"; ok "fstrim 完成"; else warn "未检测到 fstrim"; fi
 
 # ====== 汇总 & 定时 ======
-title "完成汇总" "当前资源状态"
+title "📊 汇总报告" "展示清理后资源状态"
 df -h / | sed 's/^/  /'; free -h | sed 's/^/  /'
 ok "深度清理完成 ✅"
 
-title "计划任务" "写入 crontab (每日 03:00)"
+title "⏰ 自动任务" "每日凌晨 03:00 自动运行"
 chmod +x /root/deep-clean.sh
 ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true; echo "0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1" ) | crontab -u root -
 ok "已设置每日 03:00 自动清理"
