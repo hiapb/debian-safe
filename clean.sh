@@ -245,43 +245,67 @@ single_path_or_empty() {
   fi
 }
 
-# 主流程
-CNT="$(active_count)"
-if [ "$CNT" = "0" ]; then
-  log "未检测到活动 swap，创建单一 /swapfile ..."
-  create_single_swapfile
-  normalize_fstab_to_single
-elif [ "$CNT" = "1" ]; then
-  P="$(single_path_or_empty)"
-  ok "已存在单一 swap：$P（保持不变）"
-  normalize_fstab_to_single
-else
-  warn "检测到多个 swap（${CNT} 个），将关闭全部并重建为单一 /swapfile"
-  enable_emergency_swap
-  # 关闭所有现有 swap（保留应急）
-  # 多次尝试直到无活动（或只剩应急）
+# 主流程（内存策略：<2G 才启用/保留 Swap；>=2G 一律关闭并移除）
+MEM_MB="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
+
+if [ "$MEM_MB" -ge 2048 ]; then
+  # 内存>=2G：不启用 swap，若已有则全部关闭并清理
+  warn "检测到物理内存 ${MEM_MB}MiB ≥ 2048MiB：按策略关闭并移除所有 Swap"
+  # 尝试多轮关闭所有活动 swap
   for _ in 1 2 3; do
     LIST="$(active_swaps)"
     [ -z "$LIST" ] && break
     while read -r dev; do
       [ -z "$dev" ] && continue
-      [ -n "${EMERG_DEV:-}" ] && [ "$dev" = "$EMERG_DEV" ] && continue
       swapoff "$dev" 2>/dev/null || true
-      # 尝试删除文件型
       case "$dev" in
-        /dev/*) : ;;  # 设备分区不删除文件
+        /dev/*) : ;;       # 分区不删设备
         *) rm -f "$dev" 2>/dev/null || true ;;
       esac
     done <<< "$LIST"
     sleep 1
   done
-  # 清理常见残留
+  # 清理常见残留与启动项
   rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
-  # 创建单一 /swapfile
-  create_single_swapfile
-  normalize_fstab_to_single
-  # 关闭并移除应急
-  disable_emergency_swap
+  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
+  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
+  ok "已按策略禁用并移除 Swap（内存≥2G）"
+
+else
+  # 内存<2G：按原逻辑确保系统最终只有 1 个 /swapfile
+  CNT="$(active_count)"
+  if [ "$CNT" = "0" ]; then
+    log "未检测到活动 swap，创建单一 /swapfile ..."
+    create_single_swapfile
+    normalize_fstab_to_single
+  elif [ "$CNT" = "1" ]; then
+    P="$(single_path_or_empty)"
+    ok "已存在单一 swap：$P（保持不变）"
+    normalize_fstab_to_single
+  else
+    warn "检测到多个 swap（${CNT} 个），将关闭全部并重建为单一 /swapfile"
+    enable_emergency_swap
+    # 关闭所有现有 swap（保留应急）
+    for _ in 1 2 3; do
+      LIST="$(active_swaps)"
+      [ -z "$LIST" ] && break
+      while read -r dev; do
+        [ -z "$dev" ] && continue
+        [ -n "${EMERG_DEV:-}" ] && [ "$dev" = "$EMERG_DEV" ] && continue
+        swapoff "$dev" 2>/dev/null || true
+        case "$dev" in
+          /dev/*) : ;;
+          *) rm -f "$dev" 2>/dev/null || true ;;
+        esac
+      done <<< "$LIST"
+      sleep 1
+    done
+    rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
+    create_single_swapfile
+    normalize_fstab_to_single
+    disable_emergency_swap
+  fi
 fi
 
 # 展示当前结果
