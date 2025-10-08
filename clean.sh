@@ -2,23 +2,22 @@
 # =========================================================
 # Nuro Deep Clean Script (宝塔安全版)
 # 作者: hiapb
-# 功能: 深度清理 + 日志保留1天 + 自动写入自身 + 每日3点cron
+# 功能: 深度清理 + 日志保留1天 + 自动写入自身（每次覆盖） + 每日3点cron
 # =========================================================
 
 set -e
 SCRIPT_PATH="/root/deep-clean.sh"
 
 # ========================
-# 0. 自动写入自身
+# 0. 写入自身（每次覆盖）
 # ========================
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo "📝 将脚本写入 $SCRIPT_PATH ..."
-    cat > "$SCRIPT_PATH" <<'EOF'
+echo "📝 写入脚本到 $SCRIPT_PATH ..."
+cat > "$SCRIPT_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -e
 echo -e "\n🧹 [Nuro Deep Clean] 开始深度清理...\n"
 
-# 1. 系统信息 
+# 1. 系统信息
 echo "系统信息："
 uname -a
 echo "磁盘占用前："
@@ -27,15 +26,13 @@ echo "内存使用前："
 free -h
 echo "--------------------------------------"
 
-# 2. 清理日志（排除宝塔面板和网站日志）
-echo "清理系统日志（保留1天，排除宝塔目录）..."
-# /var/log 下 .log 文件
+# 2. 清理系统日志（排除宝塔面板和网站日志，保留1天）
+echo "清理系统日志..."
 find /var/log -type f -name "*.log" \
   ! -path "/www/server/panel/logs/*" \
   ! -path "/www/wwwlogs/*" \
   -mtime +1 -exec truncate -s 0 {} \; 2>/dev/null || true
 
-# 清理 systemd 日志
 journalctl --rotate
 journalctl --vacuum-time=1d >/dev/null 2>&1 || true
 rm -rf /var/log/journal/* 2>/dev/null || true
@@ -47,13 +44,13 @@ truncate -s 0 /var/log/lastlog 2>/dev/null || true
 truncate -s 0 /var/log/faillog 2>/dev/null || true
 
 # 3. 清理 apt 缓存
-echo "清理 APT 缓存与依赖..."
+echo "清理 APT 缓存..."
 apt-get autoremove -y >/dev/null 2>&1 || true
 apt-get autoclean -y >/dev/null 2>&1 || true
 apt-get clean -y >/dev/null 2>&1 || true
 
-# 4. 清理临时文件（保留1天以内文件，避免删掉宝塔socket）
-echo "清理 /tmp 目录（仅删除超过1天未访问的文件）..."
+# 4. 清理临时文件（仅删除超过1天未访问文件）
+echo "清理 /tmp 和 /var/tmp ..."
 find /tmp -type f -atime +1 -delete 2>/dev/null || true
 find /var/tmp -type f -atime +1 -delete 2>/dev/null || true
 
@@ -64,9 +61,9 @@ for user in /home/*; do
   [ -d "$user" ] && rm -rf "$user/.cache/"* 2>/dev/null || true
 done
 
-# 6. 清理 Docker 镜像与容器
+# 6. 清理 Docker 镜像与容器（仅存在的）
 if command -v docker >/dev/null 2>&1; then
-  echo "检测到 Docker，正在清理无用镜像/容器..."
+  echo "清理 Docker 无用镜像/容器..."
   docker system prune -af --volumes --filter "until=168h" >/dev/null 2>&1 || true
 fi
 
@@ -85,10 +82,8 @@ fi
 sync
 echo 3 > /proc/sys/vm/drop_caches
 
-# 10. 设置每日3点自动定时任务
-echo "设置每日凌晨3点自动清理任务..."
+# 10. 设置每日凌晨3点自动定时任务（只添加一次）
 CRON_JOB="0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1"
-chmod +x /root/deep-clean.sh
 (crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true; echo "$CRON_JOB") | crontab -u root -
 
 # 11. 完成
@@ -100,10 +95,10 @@ free -h
 echo -e "\n🕒 自动清理任务已添加至 root crontab，每天凌晨3点执行"
 EOF
 
-    chmod +x "$SCRIPT_PATH"
-fi
+chmod +x "$SCRIPT_PATH"
 
 # ========================
-# 执行一次清理
+# 执行一次清理（安全模式）
 # ========================
+echo "🛡️ 执行深度清理..."
 bash "$SCRIPT_PATH"
