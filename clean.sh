@@ -159,52 +159,121 @@ else
   warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免引起卡顿/断连"
 fi
 
-# ====== Swap：仅“新增或启用”，绝不 swapoff ======
-title "Swap 优化" "新增/启用（绕过 busy），不做 swapoff"
+# ====== Swap 规范化（仅无则创建；最终只保留 1 个）======
+title "Swap 规范化" "有则不建；无则智能建；只保留 1 个（优先 zram）"
+
+# 是否存在任何活动 swap
 has_active_swap(){ grep -q ' swap ' /proc/swaps 2>/dev/null; }
+
+# 目标大小：物理内存一半，[256,2048] MiB，且至少保留 25% 磁盘空闲
 calc_target_mib(){
-  local mem_mib avail_mib target maxsafe
-  mem_mib=$(awk '/MemTotal/ {printf "%.0f",$2/1024}' /proc/meminfo)
-  target=$(( mem_mib / 2 )); (( target < 256 )) && target=256; (( target > 2048 )) && target=2048
-  avail_mib=$(df -Pm / | awk 'NR==2{print $4}'); maxsafe=$(( avail_mib*75/100 ))
+  local mem_kb mib target avail_mb maxsafe
+  mem_kb="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2)"
+  mib=$(( mem_kb/1024 ))
+  target=$(( mib/2 ))
+  (( target < 256 ))  && target=256
+  (( target > 2048 )) && target=2048
+  avail_mb="$(df -Pm / | tail -n1 | tr -s ' ' | cut -d' ' -f4)"
+  maxsafe=$(( avail_mb*75/100 ))
   (( target > maxsafe )) && target=$maxsafe
   echo "$target"
 }
+
+# 创建并启用 swapfile，写入唯一 fstab 条目
 mk_swap(){
   local path="$1" size="$2"
-  [[ -z "$size" || "$size" -lt 128 ]] && { warn "磁盘空间不足，跳过新建 swap"; return 1; }
+  [[ -z "$size" || "$size" -lt 128 ]] && { warn "磁盘不足，跳过新建 swap"; return 1; }
   local fs; fs=$(stat -f -c %T / 2>/dev/null || echo "")
-  [[ "$fs" == "btrfs" ]] && { touch "$path"; chattr +C "$path" 2>/dev/null || true; }
+  if [[ "$fs" == "btrfs" ]]; then touch "$path"; chattr +C "$path" 2>/dev/null || true; fi
   if ! fallocate -l ${size}M "$path" 2>/dev/null; then
     dd if=/dev/zero of="$path" bs=1M count=${size} status=none conv=fsync
   fi
-  chmod 600 "$path"
-  mkswap "$path" >/dev/null
-  swapon "$path"
-  sed -i '\|/swapfile|d' /etc/fstab 2>/dev/null || true
+  chmod 600 "$path"; mkswap "$path" >/dev/null; swapon "$path"
+  # fstab 去重 + 写入唯一条目
+  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
+  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
   echo "$path none swap sw 0 0" >> /etc/fstab
-  ok "已启用 $path (${size}MiB)"
+  ok "已启用 swap：$path (${size}MiB)"
   return 0
 }
 
+# 1) 若已有活动 swap：绝不新建
 if has_active_swap; then
-  ok "检测到已有 swap，保持现状（不动以防断连）"
+  ok "检测到已有 swap：本次不创建新的（避免重复）"
 else
-  # 尝试新建备用 swapfile（避免碰现有 busy 的同名）
-  TS=$(date +%s); TARGET=$(calc_target_mib)
-  PATH_NEW="/swapfile-${TS}"
-  if ! mk_swap "$PATH_NEW" "$TARGET"; then
-    # 兜底：zram
-    if modprobe zram 2>/dev/null && [[ -e /sys/class/zram-control/hot_add ]]; then
-      id=$(cat /sys/class/zram-control/hot_add); dev="/dev/zram${id}"
-      size=$(( $(awk '/MemTotal/{printf "%.0f",$2/1024}' /proc/meminfo) * 3 / 4 ))
-      echo "${size}M" > "/sys/block/zram${id}/disksize"
-      mkswap "$dev" >/dev/null; swapon -p 100 "$dev"
-      ok "已启用 zram swap (${size}MiB @ ${dev})"
-    else
-      warn "zram 不可用，跳过 swap 兜底"
-    fi
+  # 若没有任何 swap，则智能新建
+  TARGET="$(calc_target_mib)"
+  if ! mk_swap "/swapfile" "$TARGET"; then
+    TS="$(date +%s)"; mk_swap "/swapfile-${TS}" "$TARGET" || warn "无法创建文件型 swap；可考虑 zram 方案"
   fi
+fi
+
+# 2) 解析当前活动 swap，选择“唯一保留项”
+ACTIVE_RAW="$(swapon --show=NAME,PRIO,SIZE --bytes --noheadings 2>/dev/null || true)"
+NAMES=(); PRIOS=(); SIZES=()
+while read -r name prio size rest; do
+  [[ -z "${name:-}" ]] && continue
+  NAMES+=("$name"); PRIOS+=("${prio:-0}"); SIZES+=("${size:-0}")
+done <<< "$ACTIVE_RAW"
+
+KEEP=""  # 最终保留的那个
+# 优先保留 zram
+for ((i=0;i<${#NAMES[@]};i++)); do
+  case "${NAMES[$i]}" in /dev/zram*) KEEP="${NAMES[$i]}"; break;; esac
+done
+# 否则选 (prio desc, size desc) 最优的文件型 swap
+if [[ -z "$KEEP" && ${#NAMES[@]} -gt 0 ]]; then
+  best=0
+  for ((i=1;i<${#NAMES[@]};i++)); do
+    if (( ${PRIOS[$i]} > ${PRIOS[$best]} )) || { (( ${PRIOS[$i]} == ${PRIOS[$best]} )) && (( ${SIZES[$i]} > ${SIZES[$best]} )); }; then
+      best=$i
+    fi
+  done
+  KEEP="${NAMES[$best]}"
+fi
+[[ -n "$KEEP" ]] && ok "保留 swap：$KEEP" || warn "未能解析保留 swap（可能当前无 swap）"
+
+# 3) fstab 去重：只保留 1 条（写回 KEEP），并备份
+if [[ -f /etc/fstab ]]; then
+  cp /etc/fstab /etc/fstab.bak.deepclean 2>/dev/null || true
+  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
+  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
+  [[ -n "$KEEP" ]] && echo "$KEEP none swap sw 0 0" >> /etc/fstab
+  ok "fstab 已去重（仅保留 1 条；备份：/etc/fstab.bak.deepclean）"
+fi
+
+# 4) 运行中“只留 1 个”：尽量立刻关闭多余**文件型** swap（zram 保留）
+#    条件：MemAvailable ≥ 40% 且 Load1 ≤ 1 —— 避免 SSH 断连
+AVAIL_KB="$(grep -E '^MemAvailable:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2 || echo 0)"
+TOTAL_KB="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2 || echo 1)"
+AVAIL_PCT=$(( AVAIL_KB*100 / TOTAL_KB ))
+LOAD1_INT="$(cut -d'.' -f1 /proc/loadavg)"
+
+OTHERS=()
+for ((i=0;i<${#NAMES[@]};i++)); do
+  [[ "${NAMES[$i]}" == "$KEEP" ]] && continue
+  OTHERS+=("${NAMES[$i]}")
+done
+
+if ((${#OTHERS[@]})); then
+  if (( AVAIL_PCT >= 40 && LOAD1_INT <= 1 )); then
+    for dev in "${OTHERS[@]}"; do
+      case "$dev" in
+        /dev/zram*) warn "保留额外 zram：$dev（不关闭）" ;;
+        *)
+          swapoff "$dev" 2>/dev/null || true
+          rm -f "$dev"   2>/dev/null || true
+          ok "已关闭并移除多余 swap：$dev"
+          ;;
+      esac
+    done
+  else
+    warn "当前资源不足以立刻只留 1 个（MemAvail=${AVAIL_PCT}% / Load1=${LOAD1_INT)）；已完成 fstab 去重，重启后自然只剩 1 个"
+  fi
+else
+  ok "运行中已是单一 swap"
 fi
 
 # ====== 磁盘 TRIM ======
