@@ -32,13 +32,25 @@ EXCLUDES=(
 )
 is_excluded(){ local p="$1"; for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e"* ]] && return 0; done; return 1; }
 
-# ====== 工具与平台识别 ======
-PKG=""; HAS_APT=0; HAS_DNF=0
-if command -v apt-get >/dev/null 2>&1; then PKG="apt"; HAS_APT=1; fi
-if command -v dnf >/devnull 2>&1 || command -v dnf >/dev/null 2>&1; then PKG="dnf"; HAS_DNF=1; fi
-if [[ $HAS_DNF -eq 0 && $HAS_APT -eq 0 && command -v yum >/dev/null 2>&1 ]]; then PKG="yum"; HAS_DNF=1; fi
+# ====== 工具与平台识别（修正版）======
+PKG=""
+HAS_APT=0
+HAS_DNF=0
 
-is_vm(){ command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; } # 0=是虚机
+if command -v apt-get >/dev/null 2>&1; then
+  PKG="apt"; HAS_APT=1
+fi
+
+if command -v dnf >/dev/null 2>&1; then
+  PKG="dnf"; HAS_DNF=1
+fi
+
+# 如果没有 apt/dnf，但有 yum（老系统/RHEL系）
+if command -v yum >/dev/null 2>&1 && [ "$HAS_APT" -eq 0 ] && [ "$HAS_DNF" -eq 0 ]; then
+  PKG="yum"; HAS_DNF=1
+fi
+
+is_vm(){ command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; } # 0=虚机
 
 # 通用低优先级执行
 NI(){ nice -n 19 ionice -c3 bash -c "$*"; }
@@ -49,13 +61,14 @@ rpm_has(){ rpm -q "$1" >/dev/null 2>&1; }
 
 # 安全卸载（按发行版）
 pkg_purge(){
-  local p; for p in "$@"; do
+  local p
+  for p in "$@"; do
     case "$PKG" in
       apt)
         dpkg_has "$p" && apt-get -y purge "$p" >/dev/null 2>&1 || true
         ;;
       dnf|yum)
-        rpm_has "$p" && (dnf -y remove "$p" >/dev/null 2>&1 || yum -y remove "$p" >/dev/null 2>&1) || true
+        rpm_has "$p" && (dnf -y remove "$p" >/dev/null 2>&1 || yum -y remove "$p" >/devnull 2>&1 || yum -y remove "$p" >/dev/null 2>&1) || true
         ;;
     esac
   done
@@ -69,7 +82,7 @@ log "内存占用："; free -h | sed 's/^/  /'
 ok "概况完成"
 
 # ====== APT/Dpkg 锁处理（Deb/Ub）======
-if [[ $HAS_APT -eq 1 ]]; then
+if [ "$HAS_APT" -eq 1 ]; then
   title "🔒 进程清理" "释放 APT/Dpkg 锁"
   pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
   rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
@@ -101,7 +114,7 @@ ok "临时/缓存清理完成"
 
 # ====== 包缓存 & 历史清理（跨发行版）======
 title "📦 包缓存" "APT/DNF 历史与缓存深度清理"
-if [[ $HAS_APT -eq 1 ]]; then
+if [ "$HAS_APT" -eq 1 ]; then
   systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
   apt-get -y autoremove --purge  >/dev/null 2>&1 || true
   apt-get -y autoclean           >/dev/null 2>&1 || true
@@ -113,42 +126,35 @@ if [[ $HAS_APT -eq 1 ]]; then
   dpkg -l | awk '/^ii\s+linux-(headers|modules-extra)-/{print $2}' | grep -v "$CURK" \
     | xargs -r apt-get -y purge >/dev/null 2>&1 || true
 fi
-if [[ $HAS_DNF -eq 1 ]]; then
-  # dnf/yum 清理与自动移除未用依赖
+if [ "$HAS_DNF" -eq 1 ]; then
   (dnf -y autoremove >/dev/null 2>&1 || yum -y autoremove >/dev/null 2>&1 || true)
   (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/dev/null 2>&1 || true)
   rm -rf /var/cache/dnf/* /var/cache/yum/* 2>/dev/null || true
-  # 移除 rescue 内核镜像（不影响当前可启动项）
   pkg_purge dracut-config-rescue >/dev/null 2>&1 || true
 fi
 ok "包缓存/历史清理完成"
 
-# ====== 组件裁剪：跨发行版常见“非必需”组件 ======
+# ====== 组件裁剪：跨发行版“非必需”组件 ======
 title "✂️ 组件裁剪" "移除非必需工具包（服务器极简）"
-if [[ $HAS_APT -eq 1 ]]; then
-  # Ubuntu/Debian
+if [ "$HAS_APT" -eq 1 ]; then
   pkg_purge snapd cloud-init apport whoopsie popularity-contest \
             landscape-client ubuntu-advantage-tools update-notifier unattended-upgrades
-  # Cockpit/桌面碎件（若装了）
   pkg_purge cockpit cockpit-ws cockpit-system \
             avahi-daemon cups* modemmanager network-manager* plymouth* fwupd* \
             printer-driver-* xserver-xorg* x11-* wayland* *-doc
 fi
-if [[ $HAS_DNF -eq 1 ]]; then
-  # AlmaLinux / RHEL 系
+if [ "$HAS_DNF" -eq 1 ]; then
   pkg_purge cloud-init subscription-manager insights-client \
             cockpit cockpit-ws cockpit-system \
             abrt* sos* avahi* cups* modemmanager NetworkManager* plymouth* fwupd* \
             man-db man-pages groff-base texinfo
-  # cloud/订阅/遥测/问题诊断/桌面相关大多对纯服务器没必要
 fi
 ok "组件裁剪完成"
 
-# ====== Snap 全清（若存在，跨发行版兜底）======
+# ====== Snap 全清（兜底）======
 title "🧨 Snap 移除" "彻底移除 snapd 生态"
 if command -v snap >/dev/null 2>&1; then
-  snap list 2>/dev/null | sed '1d' | awk '{print $1}' \
-    | while read -r app; do snap remove "$app" >/dev/null 2>&1 || true; done
+  snap list 2>/dev/null | sed '1d' | awk '{print $1}' | while read -r app; do snap remove "$app" >/dev/null 2>&1 || true; done
 fi
 systemctl stop snapd.service snapd.socket 2>/dev/null || true
 umount /snap 2>/dev/null || true
@@ -158,9 +164,7 @@ ok "Snap 生态清理完成"
 
 # ====== 文档/本地化/开发静态库 瘦身 ======
 title "🧽 系统瘦身" "文档/本地化/静态库/pyc"
-# 文档（节省上百MB）
 rm -rf /usr/share/man/* /usr/share/info/* /usr/share/doc/* 2>/dev/null || true
-# locale：仅保留 en*/zh*
 if [[ -d /usr/share/locale ]]; then
   find /usr/share/locale -mindepth 1 -maxdepth 1 -type d \
     | grep -Ev '^(.*\/)?(en|zh)' | xargs -r rm -rf 2>/dev/null || true
@@ -169,22 +173,19 @@ if [[ -d /usr/lib/locale ]]; then
   ls /usr/lib/locale 2>/dev/null | grep -Ev '^(en|zh)' \
     | xargs -r -I{} rm -rf "/usr/lib/locale/{}" 2>/dev/null || true
 fi
-# Python 字节码与缓存
 NI "find / -xdev -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true"
 NI "find / -xdev -type f -name '*.pyc' -delete 2>/dev/null || true"
-# 开发静态库（运行期一般无用）
 NI "find /usr/lib /usr/lib64 /lib /lib64 -type f \( -name '*.a' -o -name '*.la' \) -delete 2>/dev/null || true"
 ok "系统瘦身完成"
 
-# ====== 云/固件裁剪（仅云虚机才移除 firmware）======
-title "☁️ 虚机裁剪" "在虚机上移除 linux-firmware（物理机保留）"
+# ====== 云/固件裁剪（仅云虚机移除 firmware）======
+title "☁️ 虚机裁剪" "虚机移除 linux-firmware（物理机保留）"
 if is_vm; then
   case "$PKG" in
-    apt)  pkg_purge linux-firmware ;;
-    dnf|yum) pkg_purge linux-firmware ;;
+    apt|dnf|yum) pkg_purge linux-firmware ;;
   esac
   rm -rf /lib/firmware/* 2>/dev/null || true
-  ok "已在虚机裁剪 firmware（物理机保留）"
+  ok "已在虚机裁剪 firmware"
 else
   warn "检测为物理机或未知虚拟化，保留 firmware 以免驱动缺失"
 fi
@@ -214,7 +215,7 @@ ok "大文件补充清理完成"
 
 # ====== 旧内核（保留当前+最新）======
 title "🧰 内核清理" "仅保留当前与最新版本"
-if [[ $HAS_APT -eq 1 ]]; then
+if [ "$HAS_APT" -eq 1 ]; then
   CURK="$(uname -r)"
   mapfile -t KS < <(dpkg -l | awk '/linux-image-[0-9]/{print $2}' | sort -V)
   KEEP=("linux-image-${CURK}")
@@ -223,10 +224,9 @@ if [[ $HAS_APT -eq 1 ]]; then
   PURGE=(); for k in "${KS[@]}"; do [[ " ${KEEP[*]} " == *" $k "* ]] || PURGE+=("$k"); done
   ((${#PURGE[@]})) && NI "apt-get -y purge ${PURGE[*]} >/dev/null 2>&1 || true"
 fi
-if [[ $HAS_DNF -eq 1 ]]; then
-  # 保留当前内核与最新一个，其余移除
-  CURK="$(uname -r | sed 's/\./\\./g')"
-  mapfile -t RMK < <(rpm -q kernel-core kernel | grep -vE "$CURK" | sort -V | head -n -1 || true)
+if [ "$HAS_DNF" -eq 1 ]; then
+  CURK_ESC="$(uname -r | sed 's/\./\\./g')"
+  mapfile -t RMK < <(rpm -q kernel-core kernel | grep -vE "$CURK_ESC" | sort -V | head -n -1 || true)
   ((${#RMK[@]})) && (dnf -y remove "${RMK[@]}" >/dev/null 2>&1 || yum -y remove "${RMK[@]}" >/dev/null 2>&1 || true)
 fi
 ok "内核清理完成"
