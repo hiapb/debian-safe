@@ -97,10 +97,6 @@ echo 3 > /proc/sys/vm/drop_caches
 # 12. 完成
 # ========================
 echo -e "\n✅ 深度清理完成！"
-df -h /
-free -h
-echo -e "\n🕒 已添加每日 3:00 自动执行任务，可用命令查看：sudo crontab -l -u root"
-echo -e "\n✅ 深度清理完成！"
 echo "磁盘占用后："
 df -h /
 echo "内存使用后："
