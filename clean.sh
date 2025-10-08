@@ -11,7 +11,7 @@
 
 set -e
 SCRIPT_PATH="/root/deep-clean.sh"
-echo "📝 正在写入/覆盖 $SCRIPT_PATH ..."
+echo "📝 正在写入111/覆盖 $SCRIPT_PATH ..."
 
 cat > "$SCRIPT_PATH" <<'EOF'
 #!/usr/bin/env bash
