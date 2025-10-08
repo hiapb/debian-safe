@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ======================================================================
-# 🌙 Nuro Deep Clean • Safe-Deep (稳态版：不 swapoff、不杀进程、BT 友好)
-# 目标：深度清理 CPU/内存/硬盘，但绝不影响宝塔/站点/数据库/PHP 与 SSH
+# 🌙 Nuro Deep Clean • Safe-Deep+
+# 深度清理 CPU/内存/硬盘；不影响宝塔/站点/数据库/PHP 与 SSH
 # ======================================================================
 
 set -e
@@ -53,7 +53,9 @@ ok "apt/dpkg 锁处理完成"
 title "🧾 日志清理" "清空旧日志 保留结构"
 journalctl --rotate || true
 journalctl --vacuum-time=1d --vacuum-size=64M >/dev/null 2>&1 || true
-NI "find /var/log -type f -not -path '/www/server/panel/logs/*' -not -path '/www/wwwlogs/*' -exec truncate -s 0 {} + 2>/dev/null || true"
+# 深度+：连轮转压缩的 *.gz/*.old 一并清
+NI "find /var/log -type f \\( -name '*.log' -o -name '*.old' -o -name '*.gz' -o -name '*.1' \\) \
+  -not -path '/www/server/panel/logs/*' -not -path '/www/wwwlogs/*' -exec truncate -s 0 {} + 2>/dev/null || true"
 : > /var/log/wtmp  || true
 : > /var/log/btmp  || true
 : > /var/log/lastlog || true
@@ -64,53 +66,56 @@ ok "日志清理完成"
 title "🧹 缓存清理" "清理 /tmp /var/tmp 等"
 NI "find /tmp -xdev -type f -atime +1 -not -name 'sess_*' -delete 2>/dev/null || true"
 NI "find /var/tmp -xdev -type f -atime +1 -delete 2>/dev/null || true"
-NI "find /tmp -xdev -type f -size +50M -not -name 'sess_*' -delete 2>/dev/null || true"
-NI "find /var/tmp -xdev -type f -size +50M -delete 2>/dev/null || true"
+NI "find /tmp -xdev -type f -size +20M -not -name 'sess_*' -delete 2>/dev/null || true"   # 深度+：阈值 50M -> 20M
+NI "find /var/tmp -xdev -type f -size +20M -delete 2>/dev/null || true"
 NI "find /var/cache -xdev -type f -mtime +1 -delete 2>/dev/null || true"
 rm -rf /var/crash/* /var/lib/systemd/coredump/* 2>/dev/null || true
+# 深度+：Nginx/fastcgi 临时
+rm -rf /var/lib/nginx/tmp/* /var/lib/nginx/body/* /var/lib/nginx/proxy/* 2>/dev/null || true
+rm -rf /var/tmp/nginx/* /var/cache/nginx/* 2>/dev/null || true
 ok "临时/缓存清理完成"
 
-# ====== 包管理缓存 ======
+# ====== 包管理缓存（深度+）======
 title "📦 包缓存" "APT / Snap / 语言缓存"
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get -y autoremove  >/dev/null 2>&1 || true
-  apt-get -y autoclean   >/dev/null 2>&1 || true
-  apt-get -y clean       >/dev/null 2>&1 || true
-  dpkg -l | awk '/^rc/{print $2}' | xargs -r dpkg -P >/dev/null 2>&1 || true
+  systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  dpkg --configure -a >/dev/null 2>&1 || true
+  apt-get -y autoremove --purge >/dev/null 2>&1 || true
+  apt-get -y autoclean >/dev/null 2>&1 || true
+  apt-get -y clean >/dev/null 2>&1 || true
+  # 清理 rc 残留
+  dpkg -l 2>/dev/null | awk '/^rc/{print $2}' | xargs -r dpkg -P >/dev/null 2>&1 || true
+  # 深度+：清空 lists/archives 目录
+  rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/cache/apt/archives/partial 2>/dev/null || true
+  # 深度+：移除非当前的 headers / modules-extra
+  CURK="$(uname -r)"
+  dpkg -l | awk '/^ii\s+linux-headers-|^ii\s+linux-modules-extra-/{print $2}' | grep -v "$CURK" | xargs -r apt-get -y purge >/dev/null 2>&1 || true
 fi
+# Snap：仅删除 disabled 修订
 if command -v snap >/dev/null 2>&1; then
-  snap list --all | awk '/disabled/{print $1, $3}' | xargs -r -n2 snap remove || true
+  snap list --all 2>/dev/null | sed '1d' | while read -r name ver rev trk pub notes; do
+    [ "$notes" = "disabled" ] && [ -n "$rev" ] && snap remove "$name" --revision="$rev" >/dev/null 2>&1 || true
+  done
+  rm -f /var/lib/snapd/snaps/*.old /var/lib/snapd/snaps/*.partial 2>/dev/null || true
 fi
+# 语言缓存（尽量不阻塞）
 command -v pip >/dev/null      && pip cache purge >/dev/null 2>&1 || true
 command -v npm >/dev/null      && npm cache clean --force >/dev/null 2>&1 || true
 command -v yarn >/dev/null     && yarn cache clean >/dev/null 2>&1 || true
+command -v pnpm >/dev/null     && pnpm store prune >/dev/null 2>&1 || true
 command -v composer >/dev/null && composer clear-cache >/dev/null 2>&1 || true
 command -v gem >/dev/null      && gem cleanup -q >/dev/null 2>&1 || true
 ok "包管理缓存清理完成"
-
-# ====== 容器清理（不动业务卷绑定）======
-title "🐳 容器清理" "Docker 残留安全删除"
-if command -v docker >/dev/null 2>&1; then
-  NI "docker builder prune -af >/dev/null 2>&1 || true"
-  NI "docker image prune   -af --filter 'until=168h' >/dev/null 2>&1 || true"
-  NI "docker container prune -f --filter 'until=24h' >/dev/null 2>&1 || true"
-  NI "docker volume prune -f >/dev/null 2>&1 || true"
-  NI "docker network prune -f >/dev/null 2>&1 || true"
-  NI "docker system prune -af --volumes >/dev/null 2>&1 || true"
-fi
-command -v ctr >/dev/null 2>&1 && NI "ctr -n k8s.io images prune >/dev/null 2>&1 || true"
-ok "容器清理完成"
 
 # ====== 备份 & 用户 Downloads —— 全量删除（不限大小）======
 title "🗄️ 备份清理" "移除系统与用户备份"
 [[ -d /www/server/backup ]] && NI "rm -rf /www/server/backup/* 2>/dev/null || true"
 [[ -d /root/Downloads    ]] && NI "rm -rf /root/Downloads/* 2>/dev/null || true"
 for d in /home/*/Downloads; do [[ -d "$d" ]] && NI "rm -rf '$d'/* 2>/dev/null || true"; done
-
-# 家目录常见压缩/备份包（不限大小）
+# 家目录常见压缩/备份包
 for base in /root /home/*; do
   [[ -d "$base" ]] || continue
-  NI "find '$base' -type f \\( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.rar' -o -name '*.7z' -o -name '*.bak' \\) -delete 2>/dev/null || true"
+  NI "find '$base' -type f \\( -name '*.zip' -o -name '*.tar' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.rar' -o -name '*.7z' -o -name '*.bak' \\) -delete 2>/dev/null || true"
 done
 ok "备份与用户下载清空完成"
 
@@ -139,177 +144,86 @@ if command -v dpkg >/dev/null 2>&1; then
 fi
 ok "内核清理完成"
 
-# ====== 内存/CPU 优化（稳态）======
+# ====== 体系文件瘦身（深度+，谨慎但安全）======
+title "🧽 系统瘦身" "移除 man/doc/多余语言 与 pyc"
+# 仅在不是容器基础镜像且磁盘足够时做
+if [[ -d /usr/share/man && -d /usr/share/doc && -d /usr/share/locale ]]; then
+  # 保留 en* / zh* 的 locale，其他移除（不影响服务运行，仅影响多语言消息）
+  find /usr/share/locale -mindepth 1 -maxdepth 1 -type d \
+    ! -name 'en*' ! -name 'zh*' -exec rm -rf {} + 2>/dev/null || true
+  # 移除 manpages & 文档（节省数百 MB）
+  rm -rf /usr/share/man/* /usr/share/doc/* 2>/dev/null || true
+fi
+# 移除 pyc/__pycache__（可再生）
+NI "find / -xdev -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true"
+NI "find / -xdev -type f -name '*.pyc' -delete 2>/dev/null || true"
+ok "系统瘦身完成"
+
+# ====== 内存/CPU 优化（稳态/深度）======
 title "⚡ 内存优化" "轻量回收 内存更流畅"
-# 仅在负载低 & 可用内存充足时做
 LOAD1=$(awk '{print int($1)}' /proc/loadavg)
 MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
 PCT=$(( MEM_AVAIL_KB*100 / MEM_TOTAL_KB ))
-
 if (( LOAD1 <= 2 && PCT >= 30 )); then
-  log "条件满足(Load1=${LOAD1}, MemAvail=${PCT}%)，执行轻量回收"
+  log "条件满足(Load1=${LOAD1}, MemAvail=${PCT}%)，执行回收"
   sync
-  echo 1 > /proc/sys/vm/drop_caches || true   # 只回收 pagecache，风险更低
+  # 深度+：更激进地回收（3 = pagecache+dentries+inodes），低负载才用
+  echo 3 > /proc/sys/vm/drop_caches || echo 1 > /proc/sys/vm/drop_caches || true
   [[ -w /proc/sys/vm/compact_memory ]] && echo 1 > /proc/sys/vm/compact_memory || true
-  # 适度降低交换倾向（不持久化）
   sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
-  ok "内存/CPU 轻量回收完成"
+  ok "内存/CPU 回收完成"
 else
-  warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免引起卡顿/断连"
+  warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免卡顿/断连"
 fi
 
-# ===== Swap 管理（单一：0->建1；1->不动；多->全关重建1） =====
+# ===== Swap 管理（<2G 保留；>=2G 移除） =====
 title "💾 Swap 管理" "智能检测并保持单一 Swap"
+calc_target_mib(){ local mem_kb mib target; mem_kb="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2)"; mib=$(( mem_kb/1024 )); target=$(( mib/2 )); (( target<256 ))&&target=256; (( target>2048 ))&&target=2048; echo "$target"; }
+active_swaps(){ swapon --show=NAME --noheadings 2>/dev/null | sed '/^$/d'; }
+active_count(){ active_swaps | wc -l | tr -d ' '; }
+enable_emergency_swap(){ EMERG_DEV=""; local size=256; if modprobe zram 2>/dev/null && [[ -e /sys/class/zram-control/hot_add ]]; then local id dev; id="$(cat /sys/class/zram-control/hot_add)"; dev="/dev/zram${id}"; echo "${size}M" > "/sys/block/zram${id}/disksize"; mkswap "$dev" >/dev/null 2>&1 && swapon -p 200 "$dev" && EMERG_DEV="$dev"; fi; if [[ -z "${EMERG_DEV:-}" ]]; then if fallocate -l ${size}M /swap.emerg 2>/dev/null || dd if=/dev/zero of=/swap.emerg bs=1M count=${size} status=none; then chmod 600 /swap.emerg; mkswap /swap.emerg >/dev/null 2>&1 && swapon -p 150 /swap.emerg && EMERG_DEV="/swap.emerg"; fi; fi; [[ -n "${EMERG_DEV:-}" ]] && ok "已启用应急 swap: $EMERG_DEV (256MiB)" || warn "应急 swap 启用失败"; }
+disable_emergency_swap(){ if [[ -n "${EMERG_DEV:-}" ]]; then swapoff "$EMERG_DEV" 2>/dev/null || true; [[ -f "$EMERG_DEV" ]] && rm -f "$EMERG_DEV" 2>/dev/null || true; ok "已关闭应急 swap: $EMERG_DEV"; EMERG_DEV=""; fi; }
+normalize_fstab_to_single(){ sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true; sed -i '\|/swapfile |d' /etc/fstab 2>/dev/null || true; sed -i '\|/dev/zram|d' /etc/fstab 2>/dev/null || true; grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab; ok "fstab 已规范为单一 /swapfile"; }
+create_single_swapfile(){ local target path fs; target="$(calc_target_mib)"; path="/swapfile"; fs="$(stat -f -c %T / 2>/dev/null || echo "")"; swapoff "$path" 2>/dev/null || true; rm -f "$path" 2>/dev/null || true; [[ "$fs" == "btrfs" ]] && { touch "$path"; chattr +C "$path" 2>/dev/null || true; }; if ! fallocate -l ${target}M "$path" 2>/dev/null; then dd if=/dev/zero of="$path" bs=1M count=${target} status=none conv=fsync; fi; chmod 600 "$path"; mkswap "$path" >/dev/null; swapon "$path"; ok "已创建并启用主 swap：$path (${target}MiB)"; }
+single_path_or_empty(){ local n p; n="$(active_count)"; if [[ "$n" == "1" ]]; then p="$(active_swaps | head -n1)"; echo "$p"; else echo ""; fi; }
 
-# 计算目标大小：内存一半，范围 [256,2048] MiB
-calc_target_mib() {
-  local mem_kb mib target
-  mem_kb="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2)"
-  mib=$(( mem_kb/1024 ))
-  target=$(( mib/2 ))
-  (( target < 256 ))  && target=256
-  (( target > 2048 )) && target=2048
-  echo "$target"
-}
-
-active_swaps() { swapon --show=NAME --noheadings 2>/dev/null | sed '/^$/d'; }
-active_count() { active_swaps | wc -l | tr -d ' '; }
-
-enable_emergency_swap() {
-  # 优先 zram 256MiB，其次 /swap.emerg 256MiB
-  EMERG_DEV=""
-  local size=256
-  if modprobe zram 2>/dev/null && [ -e /sys/class/zram-control/hot_add ]; then
-    local id dev
-    id="$(cat /sys/class/zram-control/hot_add)"
-    dev="/dev/zram${id}"
-    echo "${size}M" > "/sys/block/zram${id}/disksize"
-    mkswap "$dev" >/dev/null 2>&1 && swapon -p 200 "$dev" && EMERG_DEV="$dev"
-  fi
-  if [ -z "$EMERG_DEV" ]; then
-    if fallocate -l ${size}M /swap.emerg 2>/dev/null || dd if=/dev/zero of=/swap.emerg bs=1M count=${size} status=none; then
-      chmod 600 /swap.emerg
-      mkswap /swap.emerg >/dev/null 2>&1 && swapon -p 150 /swap.emerg && EMERG_DEV="/swap.emerg"
-    fi
-  fi
-  if [ -n "$EMERG_DEV" ]; then ok "已启用应急 swap: $EMERG_DEV (256MiB)"; else warn "应急 swap 启用失败（继续尝试）"; fi
-}
-
-disable_emergency_swap() {
-  if [ -n "$EMERG_DEV" ]; then
-    swapoff "$EMERG_DEV" 2>/dev/null || true
-    [ -f "$EMERG_DEV" ] && rm -f "$EMERG_DEV" 2>/dev/null || true
-    ok "已关闭应急 swap: $EMERG_DEV"
-    EMERG_DEV=""
-  fi
-}
-
-normalize_fstab_to_single() {
-  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
-  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
-  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
-  grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-  ok "fstab 已规范为单一 /swapfile"
-}
-
-create_single_swapfile() {
-  local target path fs
-  target="$(calc_target_mib)"
-  path="/swapfile"
-  fs="$(stat -f -c %T / 2>/dev/null || echo "")"
-  # 确保没有同名占用
-  swapoff "$path" 2>/dev/null || true
-  rm -f "$path" 2>/dev/null || true
-  # btrfs 关闭COW
-  if [ "$fs" = "btrfs" ]; then touch "$path"; chattr +C "$path" 2>/dev/null || true; fi
-  if ! fallocate -l ${target}M "$path" 2>/dev/null; then
-    dd if=/dev/zero of="$path" bs=1M count=${target} status=none conv=fsync
-  fi
-  chmod 600 "$path"
-  mkswap "$path" >/dev/null
-  swapon "$path"
-  ok "已创建并启用主 swap：$path (${target}MiB)"
-}
-
-single_path_or_empty() {
-  # 返回唯一活动 swap 的路径（若正好 1 个），否则返回空
-  local n p
-  n="$(active_count)"
-  if [ "$n" = "1" ]; then
-    p="$(active_swaps | head -n1)"
-    echo "$p"
-  else
-    echo ""
-  fi
-}
-
-# 主流程（内存策略：<2G 才启用/保留 Swap；>=2G 一律关闭并移除）
 MEM_MB="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)"
-
-if [ "$MEM_MB" -ge 2048 ]; then
-  # 内存>=2G：不启用 swap，若已有则全部关闭并清理
-  warn "检测到物理内存 ${MEM_MB}MiB ≥ 2048MiB：按策略关闭并移除所有 Swap"
-  # 尝试多轮关闭所有活动 swap
+if [[ "$MEM_MB" -ge 2048 ]]; then
+  warn "物理内存 ${MEM_MB}MiB ≥ 2048MiB：按策略禁用并移除所有 Swap"
   for _ in 1 2 3; do
-    LIST="$(active_swaps)"
-    [ -z "$LIST" ] && break
-    while read -r dev; do
-      [ -z "$dev" ] && continue
-      swapoff "$dev" 2>/dev/null || true
-      case "$dev" in
-        /dev/*) : ;;       # 分区不删设备
-        *) rm -f "$dev" 2>/dev/null || true ;;
-      esac
-    done <<< "$LIST"
+    LIST="$(active_swaps)"; [[ -z "$LIST" ]] && break
+    while read -r dev; do [[ -z "$dev" ]] && continue; swapoff "$dev" 2>/dev/null || true; case "$dev" in /dev/*) : ;; *) rm -f "$dev" 2>/dev/null || true ;; esac; done <<< "$LIST"
     sleep 1
   done
-  # 清理常见残留与启动项
   rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
   sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
-  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
-  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
-  ok "已按策略禁用并移除 Swap（内存≥2G）"
-
+  sed -i '\|/swapfile |d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/dev/zram|d' /etc/fstab 2>/dev/null || true
+  ok "已禁用并移除 Swap（内存≥2G）"
 else
-  # 内存<2G：按原逻辑确保系统最终只有 1 个 /swapfile
   CNT="$(active_count)"
-  if [ "$CNT" = "0" ]; then
+  if [[ "$CNT" == "0" ]]; then
     log "未检测到活动 swap，创建单一 /swapfile ..."
-    create_single_swapfile
-    normalize_fstab_to_single
-  elif [ "$CNT" = "1" ]; then
-    P="$(single_path_or_empty)"
-    ok "已存在单一 swap：$P（保持不变）"
-    normalize_fstab_to_single
+    create_single_swapfile; normalize_fstab_to_single
+  elif [[ "$CNT" == "1" ]]; then
+    P="$(single_path_or_empty)"; ok "已存在单一 swap：$P（保持不变）"; normalize_fstab_to_single
   else
     warn "检测到多个 swap（${CNT} 个），将关闭全部并重建为单一 /swapfile"
     enable_emergency_swap
-    # 关闭所有现有 swap（保留应急）
     for _ in 1 2 3; do
-      LIST="$(active_swaps)"
-      [ -z "$LIST" ] && break
-      while read -r dev; do
-        [ -z "$dev" ] && continue
-        [ -n "${EMERG_DEV:-}" ] && [ "$dev" = "$EMERG_DEV" ] && continue
+      LIST="$(active_swaps)"; [[ -z "$LIST" ]] && break
+      while read -r dev; do [[ -z "$dev" ]] && continue; [[ -n "${EMERG_DEV:-}" && "$dev" == "$EMERG_DEV" ]] && continue
         swapoff "$dev" 2>/dev/null || true
-        case "$dev" in
-          /dev/*) : ;;
-          *) rm -f "$dev" 2>/dev/null || true ;;
-        esac
+        case "$dev" in /dev/*) : ;; *) rm -f "$dev" 2>/dev/null || true ;; esac
       done <<< "$LIST"
       sleep 1
     done
     rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
-    create_single_swapfile
-    normalize_fstab_to_single
-    disable_emergency_swap
+    create_single_swapfile; normalize_fstab_to_single; disable_emergency_swap
   fi
 fi
-
-# 展示当前结果
-log "当前活动 swap："
-( swapon --show || echo "  (none)" ) | sed 's/^/  /'
+log "当前活动 swap："; ( swapon --show || echo "  (none)" ) | sed 's/^/  /'
 
 # ====== 磁盘 TRIM ======
 title "🪶 磁盘优化" "执行 fstrim 提升性能"
