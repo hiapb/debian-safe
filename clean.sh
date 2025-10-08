@@ -159,68 +159,119 @@ else
   warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免引起卡顿/断连"
 fi
 
-# ====== Swap 优化（智能重建，确保仅保留 1 个，安全不掉线）======
-title "Swap 优化" "安全重建（不掉 SSH；最终仅保留 1 个）"
+# ===== Swap 强制重建（关闭所有，再重建为单一 /swapfile） =====
+title "Swap Rebuild" "swapoff all -> build a single /swapfile"
 
-has_swap(){ grep -q ' swap ' /proc/swaps 2>/dev/null; }
-
-calc_target_mib(){
-  local mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-  local mib=$(( mem_kb / 1024 ))
-  local target=$(( mib / 2 ))
-  (( target < 256 )) && target=256
+# 计算目标大小：内存一半，范围 [256,2048] MiB
+calc_target_mib() {
+  local mem_kb mib target
+  mem_kb="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2)"
+  mib=$(( mem_kb/1024 ))
+  target=$(( mib/2 ))
+  (( target < 256 ))  && target=256
   (( target > 2048 )) && target=2048
   echo "$target"
 }
 
-safe_swap_rebuild(){
-  local TARGET_MIB=$(calc_target_mib)
-  local NEW="/swapfile-new"
-  local LOAD=$(cut -d'.' -f1 /proc/loadavg)
-  local MEM_AVAIL=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-  local MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-  local PCT=$(( MEM_AVAIL*100 / MEM_TOTAL ))
-
-  if (( LOAD > 1 || PCT < 40 )); then
-    warn "系统负载高或内存紧张 (Load=${LOAD}, MemAvail=${PCT}%)，暂不重建 swap。"
-    return
+# 创建应急 swap：优先 zram(256MiB)，不行则临时文件 /swap.emerg (256MiB)
+EMERG_DEV=""
+ensure_emergency_swap() {
+  local size=256
+  # 优先 zram
+  if modprobe zram 2>/dev/null && [[ -e /sys/class/zram-control/hot_add ]]; then
+    local id dev="/dev/zram$(cat /sys/class/zram-control/hot_add)"
+    echo "${size}M" > "/sys/block/$(basename "$dev")/disksize"
+    mkswap "$dev" >/dev/null 2>&1 && swapon -p 200 "$dev" && EMERG_DEV="$dev"
   fi
-
-  log "创建临时 swap ${NEW} (${TARGET_MIB}MiB)"
-  fallocate -l ${TARGET_MIB}M "$NEW" 2>/dev/null || dd if=/dev/zero of="$NEW" bs=1M count=${TARGET_MIB} status=none
-  chmod 600 "$NEW"
-  mkswap "$NEW" >/dev/null 2>&1
-  swapon "$NEW"
-  ok "临时 swap 已启用"
-
-  log "安全关闭旧 swap..."
-  while read -r dev _; do
-    [[ "$dev" == "$NEW" ]] && continue
-    swapoff "$dev" 2>/dev/null || warn "无法关闭 $dev"
-    rm -f "$dev" 2>/dev/null || true
-    ok "已移除旧 swap：$dev"
-  done < <(swapon --show=NAME --noheadings)
-
-  log "切换新 swap 为主用"
-  sed -i '/swapfile/d' /etc/fstab 2>/dev/null
-  mv -f "$NEW" /swapfile
-  echo "/swapfile none swap sw 0 0" >> /etc/fstab
-  ok "swap 已重建完毕，仅保留 1 个 (/swapfile)"
+  # 退回临时文件
+  if [[ -z "$EMERG_DEV" ]]; then
+    if fallocate -l ${size}M /swap.emerg 2>/dev/null || dd if=/dev/zero of=/swap.emerg bs=1M count=${size} status=none; then
+      chmod 600 /swap.emerg
+      mkswap /swap.emerg >/dev/null 2>&1 && swapon -p 150 /swap.emerg && EMERG_DEV="/swap.emerg"
+    fi
+  fi
+  if [[ -n "$EMERG_DEV" ]]; then ok "emergency swap on: $EMERG_DEV (256MiB)"; else warn "failed to enable emergency swap"; fi
 }
 
-if has_swap; then
-  safe_swap_rebuild
-else
-  log "未检测到 swap，智能创建中..."
-  TARGET_MIB=$(calc_target_mib)
-  fallocate -l ${TARGET_MIB}M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=${TARGET_MIB} status=none
-  chmod 600 /swapfile
-  mkswap /swapfile >/dev/null
-  swapon /swapfile
-  echo "/swapfile none swap sw 0 0" >> /etc/fstab
-  ok "已创建并启用 swap (${TARGET_MIB}MiB)"
-fi
+# 关闭所有活动 swap（包括 /swapfile 与各类 swapfile/分区/zram）
+swapoff_all() {
+  local listed names
+  # 多次尝试，直到没有活动 swap
+  for _ in 1 2 3; do
+    listed="$(swapon --show=NAME --noheadings 2>/dev/null || true)"
+    [[ -z "$listed" ]] && break
+    while read -r dev; do
+      [[ -z "$dev" ]] && continue
+      swapoff "$dev" 2>/dev/null || true
+    done <<< "$listed"
+    sleep 1
+  done
+  if swapon --show | grep -q .; then
+    warn "some swap still active:"
+    swapon --show | sed 's/^/  /'
+  else
+    ok "all swapoff done"
+  fi
+}
 
+# 清理残留 swap 文件
+cleanup_swapfiles() {
+  # 清理常见路径：/swapfile /swapfile-* /swap.emerg
+  rm -f /swap.emerg 2>/dev/null || true
+  rm -f /swapfile 2>/dev/null || true
+  rm -f /swapfile-* 2>/dev/null || true
+}
+
+# 写 fstab 只留 /swapfile
+write_fstab_single() {
+  cp /etc/fstab /etc/fstab.bak.deepclean 2>/dev/null || true
+  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
+  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
+  echo "/swapfile none swap sw 0 0" >> /etc/fstab
+  ok "fstab normalized -> single /swapfile (backup: /etc/fstab.bak.deepclean)"
+}
+
+# 创建 /swapfile 并启用
+create_main_swapfile() {
+  local target size path fs
+  target="$(calc_target_mib)"
+  path="/swapfile"
+  fs="$(stat -f -c %T / 2>/dev/null || echo "")"
+  if [[ "$fs" == "btrfs" ]]; then touch "$path"; chattr +C "$path" 2>/dev/null || true; fi
+  # 确保不存在同名、且没被占用
+  rm -f "$path" 2>/dev/null || true
+  if ! fallocate -l ${target}M "$path" 2>/dev/null; then
+    dd if=/dev/zero of="$path" bs=1M count=${target} status=none conv=fsync
+  fi
+  chmod 600 "$path"
+  mkswap "$path" >/dev/null
+  swapon "$path"
+  ok "main swap on: $path (${target}MiB)"
+}
+
+# 拆除应急 swap
+teardown_emergency_swap() {
+  if [[ -n "$EMERG_DEV" ]]; then
+    swapoff "$EMERG_DEV" 2>/dev/null || true
+    [[ -f "$EMERG_DEV" ]] && rm -f "$EMERG_DEV" 2>/dev/null || true
+    ok "emergency swap off: $EMERG_DEV"
+    EMERG_DEV=""
+  fi
+}
+
+# === 执行顺序 ===
+ttl "Swap Rebuild (force)"
+ensure_emergency_swap
+swapoff_all
+cleanup_swapfiles
+write_fstab_single
+create_main_swapfile
+teardown_emergency_swap
+
+# 展示结果
+log "active swap now:"
+(swapon --show || echo "  (none)") | sed 's/^/  /'
 # ====== 磁盘 TRIM ======
 title "磁盘优化" "fstrim（若可用）"
 if command -v fstrim >/dev/null 2>&1; then NI "fstrim -av >/dev/null 2>&1 || true"; ok "fstrim 完成"; else warn "未检测到 fstrim"; fi
