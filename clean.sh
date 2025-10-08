@@ -11,7 +11,7 @@
 
 set -e 
 SCRIPT_PATH="/root/deep-clean.sh" 
-echo "📝 写入/覆盖 $SCRIPT_PATH ..." 
+echo "📝 写入111/覆盖 $SCRIPT_PATH ..." 
 cat > "$SCRIPT_PATH" <<'EOF' 
 #!/usr/bin/env bash 
 set -Eeuo pipefail 
