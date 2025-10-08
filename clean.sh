@@ -159,8 +159,8 @@ else
   warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免引起卡顿/断连"
 fi
 
-# ===== Swap 强制重建（关闭所有，再重建为单一 /swapfile） =====
-title "Swap Rebuild" "swapoff all -> build a single /swapfile"
+# ===== Swap 管理（单一：0->建1；1->不动；多->全关重建1） =====
+title "Swap 管理" "0->创建；1->保持；多->关闭全部并重建为单一 /swapfile"
 
 # 计算目标大小：内存一半，范围 [256,2048] MiB
 calc_target_mib() {
@@ -173,105 +173,121 @@ calc_target_mib() {
   echo "$target"
 }
 
-# 创建应急 swap：优先 zram(256MiB)，不行则临时文件 /swap.emerg (256MiB)
-EMERG_DEV=""
-ensure_emergency_swap() {
+active_swaps() { swapon --show=NAME --noheadings 2>/dev/null | sed '/^$/d'; }
+active_count() { active_swaps | wc -l | tr -d ' '; }
+
+enable_emergency_swap() {
+  # 优先 zram 256MiB，其次 /swap.emerg 256MiB
+  EMERG_DEV=""
   local size=256
-  # 优先 zram
-  if modprobe zram 2>/dev/null && [[ -e /sys/class/zram-control/hot_add ]]; then
-    local id dev="/dev/zram$(cat /sys/class/zram-control/hot_add)"
-    echo "${size}M" > "/sys/block/$(basename "$dev")/disksize"
+  if modprobe zram 2>/dev/null && [ -e /sys/class/zram-control/hot_add ]; then
+    local id dev
+    id="$(cat /sys/class/zram-control/hot_add)"
+    dev="/dev/zram${id}"
+    echo "${size}M" > "/sys/block/zram${id}/disksize"
     mkswap "$dev" >/dev/null 2>&1 && swapon -p 200 "$dev" && EMERG_DEV="$dev"
   fi
-  # 退回临时文件
-  if [[ -z "$EMERG_DEV" ]]; then
+  if [ -z "$EMERG_DEV" ]; then
     if fallocate -l ${size}M /swap.emerg 2>/dev/null || dd if=/dev/zero of=/swap.emerg bs=1M count=${size} status=none; then
       chmod 600 /swap.emerg
       mkswap /swap.emerg >/dev/null 2>&1 && swapon -p 150 /swap.emerg && EMERG_DEV="/swap.emerg"
     fi
   fi
-  if [[ -n "$EMERG_DEV" ]]; then ok "emergency swap on: $EMERG_DEV (256MiB)"; else warn "failed to enable emergency swap"; fi
+  if [ -n "$EMERG_DEV" ]; then ok "已启用应急 swap: $EMERG_DEV (256MiB)"; else warn "应急 swap 启用失败（继续尝试）"; fi
 }
 
-# 关闭所有活动 swap（包括 /swapfile 与各类 swapfile/分区/zram）
-swapoff_all() {
-  local listed names
-  # 多次尝试，直到没有活动 swap
-  for _ in 1 2 3; do
-    listed="$(swapon --show=NAME --noheadings 2>/dev/null || true)"
-    [[ -z "$listed" ]] && break
-    while read -r dev; do
-      [[ -z "$dev" ]] && continue
-      swapoff "$dev" 2>/dev/null || true
-    done <<< "$listed"
-    sleep 1
-  done
-  if swapon --show | grep -q .; then
-    warn "some swap still active:"
-    swapon --show | sed 's/^/  /'
-  else
-    ok "all swapoff done"
+disable_emergency_swap() {
+  if [ -n "$EMERG_DEV" ]; then
+    swapoff "$EMERG_DEV" 2>/dev/null || true
+    [ -f "$EMERG_DEV" ] && rm -f "$EMERG_DEV" 2>/dev/null || true
+    ok "已关闭应急 swap: $EMERG_DEV"
+    EMERG_DEV=""
   fi
 }
 
-# 清理残留 swap 文件
-cleanup_swapfiles() {
-  # 清理常见路径：/swapfile /swapfile-* /swap.emerg
-  rm -f /swap.emerg 2>/dev/null || true
-  rm -f /swapfile 2>/dev/null || true
-  rm -f /swapfile-* 2>/dev/null || true
-}
-
-# 写 fstab 只留 /swapfile
-write_fstab_single() {
+normalize_fstab_to_single() {
   cp /etc/fstab /etc/fstab.bak.deepclean 2>/dev/null || true
   sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
   sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
   sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
   echo "/swapfile none swap sw 0 0" >> /etc/fstab
-  ok "fstab normalized -> single /swapfile (backup: /etc/fstab.bak.deepclean)"
+  ok "fstab 已规范为单一 /swapfile（备份：/etc/fstab.bak.deepclean）"
 }
 
-# 创建 /swapfile 并启用
-create_main_swapfile() {
-  local target size path fs
+create_single_swapfile() {
+  local target path fs
   target="$(calc_target_mib)"
   path="/swapfile"
   fs="$(stat -f -c %T / 2>/dev/null || echo "")"
-  if [[ "$fs" == "btrfs" ]]; then touch "$path"; chattr +C "$path" 2>/dev/null || true; fi
-  # 确保不存在同名、且没被占用
+  # 确保没有同名占用
+  swapoff "$path" 2>/dev/null || true
   rm -f "$path" 2>/dev/null || true
+  # btrfs 关闭COW
+  if [ "$fs" = "btrfs" ]; then touch "$path"; chattr +C "$path" 2>/dev/null || true; fi
   if ! fallocate -l ${target}M "$path" 2>/dev/null; then
     dd if=/dev/zero of="$path" bs=1M count=${target} status=none conv=fsync
   fi
   chmod 600 "$path"
   mkswap "$path" >/dev/null
   swapon "$path"
-  ok "main swap on: $path (${target}MiB)"
+  ok "已创建并启用主 swap：$path (${target}MiB)"
 }
 
-# 拆除应急 swap
-teardown_emergency_swap() {
-  if [[ -n "$EMERG_DEV" ]]; then
-    swapoff "$EMERG_DEV" 2>/dev/null || true
-    [[ -f "$EMERG_DEV" ]] && rm -f "$EMERG_DEV" 2>/dev/null || true
-    ok "emergency swap off: $EMERG_DEV"
-    EMERG_DEV=""
+single_path_or_empty() {
+  # 返回唯一活动 swap 的路径（若正好 1 个），否则返回空
+  local n p
+  n="$(active_count)"
+  if [ "$n" = "1" ]; then
+    p="$(active_swaps | head -n1)"
+    echo "$p"
+  else
+    echo ""
   fi
 }
 
-# === 执行顺序 ===
-ttl "Swap Rebuild (force)"
-ensure_emergency_swap
-swapoff_all
-cleanup_swapfiles
-write_fstab_single
-create_main_swapfile
-teardown_emergency_swap
+# 主流程
+CNT="$(active_count)"
+if [ "$CNT" = "0" ]; then
+  log "未检测到活动 swap，创建单一 /swapfile ..."
+  create_single_swapfile
+  normalize_fstab_to_single
+elif [ "$CNT" = "1" ]; then
+  P="$(single_path_or_empty)"
+  ok "已存在单一 swap：$P（保持不变）"
+  normalize_fstab_to_single
+else
+  warn "检测到多个 swap（${CNT} 个），将关闭全部并重建为单一 /swapfile"
+  enable_emergency_swap
+  # 关闭所有现有 swap（保留应急）
+  # 多次尝试直到无活动（或只剩应急）
+  for _ in 1 2 3; do
+    LIST="$(active_swaps)"
+    [ -z "$LIST" ] && break
+    while read -r dev; do
+      [ -z "$dev" ] && continue
+      [ -n "${EMERG_DEV:-}" ] && [ "$dev" = "$EMERG_DEV" ] && continue
+      swapoff "$dev" 2>/dev/null || true
+      # 尝试删除文件型
+      case "$dev" in
+        /dev/*) : ;;  # 设备分区不删除文件
+        *) rm -f "$dev" 2>/dev/null || true ;;
+      esac
+    done <<< "$LIST"
+    sleep 1
+  done
+  # 清理常见残留
+  rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
+  # 创建单一 /swapfile
+  create_single_swapfile
+  normalize_fstab_to_single
+  # 关闭并移除应急
+  disable_emergency_swap
+fi
 
-# 展示结果
-log "active swap now:"
-(swapon --show || echo "  (none)") | sed 's/^/  /'
+# 展示当前结果
+log "当前活动 swap："
+( swapon --show || echo "  (none)" ) | sed 's/^/  /'
+
 # ====== 磁盘 TRIM ======
 title "磁盘优化" "fstrim（若可用）"
 if command -v fstrim >/dev/null 2>&1; then NI "fstrim -av >/dev/null 2>&1 || true"; ok "fstrim 完成"; else warn "未检测到 fstrim"; fi
