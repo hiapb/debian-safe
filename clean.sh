@@ -206,12 +206,11 @@ disable_emergency_swap() {
 }
 
 normalize_fstab_to_single() {
-  cp /etc/fstab /etc/fstab.bak.deepclean 2>/dev/null || true
   sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
   sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
   sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
-  echo "/swapfile none swap sw 0 0" >> /etc/fstab
-  ok "fstab 已规范为单一 /swapfile（备份：/etc/fstab.bak.deepclean）"
+  grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+  ok "fstab 已规范为单一 /swapfile"
 }
 
 create_single_swapfile() {
