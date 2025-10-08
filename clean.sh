@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # =========================================================
-# Nuro Deep Clean Script (宝塔安全版)
+# Nuro Deep Clean Script (宝塔彻底版)
 # 作者: hiapb
-# 功能: 深度清理 + 日志保留1天 + 自动写入自身（每次覆盖） + 每日3点cron
+# 功能: 深度清理 + 日志保留1天 + 自动删除无用备份/大文件/下载 + 自动写入自身 + 每日3点cron
 # =========================================================
 
 set -e
 SCRIPT_PATH="/root/deep-clean.sh"
 
 # ========================
-# 0. 写入自身（每次覆盖）
+# 0. 自动写入自身（覆盖旧文件）
 # ========================
-echo "📝 写入脚本到 $SCRIPT_PATH ..."
+echo "📝 正在写入脚本到 $SCRIPT_PATH ..."
 cat > "$SCRIPT_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -e
+
 echo -e "\n🧹 [Nuro Deep Clean] 开始深度清理...\n"
 
 # 1. 系统信息
@@ -26,9 +27,9 @@ echo "内存使用前："
 free -h
 echo "--------------------------------------"
 
-# 2. 清理系统日志（排除宝塔面板和网站日志，保留1天）
+# 2. 清理日志（保留1天，排除宝塔面板和网站日志）
 echo "清理系统日志..."
-find /var/log -type f -name "*.log" \
+find /var/log -type f \( -name "*.log" -o -name "*.old" -o -name "*.gz" \) \
   ! -path "/www/server/panel/logs/*" \
   ! -path "/www/wwwlogs/*" \
   -mtime +1 -exec truncate -s 0 {} \; 2>/dev/null || true
@@ -37,20 +38,23 @@ journalctl --rotate
 journalctl --vacuum-time=1d >/dev/null 2>&1 || true
 rm -rf /var/log/journal/* 2>/dev/null || true
 
-# 清理登录记录
 truncate -s 0 /var/log/wtmp 2>/dev/null || true
 truncate -s 0 /var/log/btmp 2>/dev/null || true
 truncate -s 0 /var/log/lastlog 2>/dev/null || true
 truncate -s 0 /var/log/faillog 2>/dev/null || true
 
-# 3. 清理 apt 缓存
-echo "清理 APT 缓存..."
+# 3. 清理 APT 缓存和孤立包
+echo "清理 APT 缓存与依赖..."
 apt-get autoremove -y >/dev/null 2>&1 || true
 apt-get autoclean -y >/dev/null 2>&1 || true
 apt-get clean -y >/dev/null 2>&1 || true
 
-# 4. 清理临时文件（仅删除超过1天未访问文件）
-echo "清理 /tmp 和 /var/tmp ..."
+if command -v deborphan >/dev/null 2>&1; then
+  deborphan 2>/dev/null | xargs apt-get -y remove --purge >/dev/null 2>&1 || true
+fi
+
+# 4. 清理临时文件（保留1天以内文件，避免删掉宝塔socket）
+echo "清理 /tmp 和 /var/tmp（超过1天未访问文件删除）..."
 find /tmp -type f -atime +1 -delete 2>/dev/null || true
 find /var/tmp -type f -atime +1 -delete 2>/dev/null || true
 
@@ -61,9 +65,9 @@ for user in /home/*; do
   [ -d "$user" ] && rm -rf "$user/.cache/"* 2>/dev/null || true
 done
 
-# 6. 清理 Docker 镜像与容器（仅存在的）
+# 6. 清理 Docker 镜像与容器
 if command -v docker >/dev/null 2>&1; then
-  echo "清理 Docker 无用镜像/容器..."
+  echo "检测到 Docker，清理无用镜像/容器..."
   docker system prune -af --volumes --filter "until=168h" >/dev/null 2>&1 || true
 fi
 
@@ -72,18 +76,32 @@ echo "清理旧内核..."
 CURRENT_KERNEL=$(uname -r)
 dpkg -l | grep linux-image | awk '{print $2}' | grep -v "$CURRENT_KERNEL" | xargs apt-get -y purge >/dev/null 2>&1 || true
 
-# 8. 清理孤立包
-echo "清理孤立包..."
-if command -v deborphan >/dev/null 2>&1; then
-  deborphan 2>/dev/null | xargs apt-get -y remove --purge >/dev/null 2>&1 || true
-fi
+# 8. 删除无用备份、下载和大文件
+echo "清理备份、下载和大文件..."
+# 宝塔备份目录（删除所有）
+rm -rf /www/server/backup/* 2>/dev/null || true
+# 用户下载目录（全部删除）
+rm -rf /home/*/Downloads/* 2>/dev/null || true
+# 删除 /root/Downloads 等
+rm -rf /root/Downloads/* 2>/dev/null || true
+# 删除 /tmp 下大于100MB的文件
+find /tmp -type f -size +100M -delete 2>/dev/null || true
+find /var/tmp -type f -size +100M -delete 2>/dev/null || true
+# 删除其他无用大文件（.zip .tar.gz .bak）
+find / -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.bak" \) \
+  ! -path "/www/server/panel/*" \
+  ! -path "/www/wwwlogs/*" \
+  ! -path "/var/lib/mysql/*" \
+  -size +100M -exec rm -f {} \; 2>/dev/null || true
 
 # 9. 释放内存缓存
 sync
 echo 3 > /proc/sys/vm/drop_caches
 
-# 10. 设置每日凌晨3点自动定时任务（只添加一次）
+# 10. 设置每日3点自动定时任务
+echo "设置每日凌晨3点自动清理任务..."
 CRON_JOB="0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1"
+chmod +x /root/deep-clean.sh
 (crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true; echo "$CRON_JOB") | crontab -u root -
 
 # 11. 完成
@@ -98,7 +116,6 @@ EOF
 chmod +x "$SCRIPT_PATH"
 
 # ========================
-# 执行一次清理（安全模式）
+# 执行一次清理
 # ========================
-echo "🛡️ 执行深度清理..."
 bash "$SCRIPT_PATH"
