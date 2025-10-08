@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
 # ======================================================================
-# Nuro Deep Clean • Safe-Deep (Clean Output · Intelligent Swap · BT Safe)
+# 💥 Nuro Deep Clean • Safe-Deep COLOR (BT友好 · 智能单一Swap · 彩色输出)
+# - 深度清理 CPU/内存/硬盘
+# - 智能 Swap：只保留 1 个；若无则新建（安全自适应容量）；去重 fstab
+# - 宝塔/网站/数据库/PHP/session 强保护
+# - 彩色美观输出；每天 03:00 自动执行
 # ======================================================================
 
 set -e
 SCRIPT_PATH="/root/deep-clean.sh"
-echo "Writing script to ${SCRIPT_PATH} ..."
 
+echo "📝 正在写入/覆盖 $SCRIPT_PATH ..."
 cat > "$SCRIPT_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# ----------------------------- UI -----------------------------
-line(){ printf '%s\n' '----------------------------------------------------------------'; }
-sec(){ printf '\n== %s ==\n' "$1"; line; }
-ok(){  printf 'OK: %s\n' "$*"; }
-warn(){ printf 'WARN: %s\n' "$*"; }
-fail(){ printf 'FAIL: %s\n' "$*"; }
-trap 'fail "error at line $LINENO"; exit 1' ERR
+# ============ 彩色输出 ============ #
+C0="\033[0m"; B="\033[1m"; DIM="\033[2m"
+BLU="\033[38;5;33m"; GRN="\033[38;5;40m"; YEL="\033[38;5;178m"; RED="\033[38;5;196m"; CYA="\033[36m"; GY="\033[90m"
+hr(){ printf "${GY}%s${C0}\n" "────────────────────────────────────────────────────────"; }
+ttl(){ printf "\n${B}${BLU}%s${C0}\n" "$1"; hr; }
+ok(){  printf "${GRN}✔${C0} %s\n" "$*"; }
+warn(){printf "${YEL}⚠${C0} %s\n" "$*"; }
+err(){ printf "${RED}✘${C0} %s\n" "$*"; }
+log(){ printf "${CYA}•${C0} %s\n" "$*"; }
+trap 'err "出错：行 $LINENO"; exit 1' ERR
 
-# ---------------------- Strong Protection ---------------------
+# ============ 强保护目录（绝不触碰）=========== #
 EXCLUDES=(
   "/www/server/panel" "/www/wwwlogs" "/www/wwwroot"
   "/www/server/nginx" "/www/server/apache" "/www/server/openresty"
@@ -29,29 +36,26 @@ EXCLUDES=(
 )
 is_excluded(){ local p="$1"; for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e"* ]] && return 0; done; return 1; }
 
-# ------------------------ Quick Status ------------------------
-sec "System Status (Before)"
-uname -a
-echo
-echo "[Disk (/)]"
-df -h /
-echo
-echo "[Memory]"
-free -h
-echo
-echo "[Swap]"
-{ swapon --show || true; } | sed 's/^/  /' || true
-line
+# ============ 降优先级工具 ============ #
+NI(){ nice -n 19 ionice -c3 bash -c "$*"; }
 
-# -------------------- APT Locks (safe) -----------------------
-sec "APT Locks"
+# ============ 状态（前）=========== #
+ttl "系统概况（清理前）"
+uname -a | sed 's/^/  /'
+log "磁盘（/）："; df -h / | sed 's/^/  /'
+log "内存：";      free -h  | sed 's/^/  /'
+log "Swap：";     (swapon --show || true) | sed 's/^/  /' || true
+hr
+
+# ============ 进程与锁（APT）=========== #
+ttl "进程与锁（仅 APT 相关）"
 pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
 rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
 dpkg --configure -a >/dev/null 2>&1 || true
-ok "APT/dpkg locks handled"
+ok "APT/dpkg 锁已清"
 
-# --------------------- Logs (keep 1 day) ---------------------
-sec "Logs (keep 1 day; preserve structure)"
+# ============ 日志（保1天，保结构）=========== #
+ttl "日志清理（保留 1 天）"
 journalctl --rotate || true
 journalctl --vacuum-time=1d --vacuum-size=64M >/dev/null 2>&1 || true
 find /var/log -type f \
@@ -61,75 +65,75 @@ find /var/log -type f \
 : > /var/log/btmp  || true
 : > /var/log/lastlog || true
 : > /var/log/faillog || true
-ok "Logs cleaned"
+ok "日志清理完成"
 
-# ---------------- Temp & Caches (safe) -----------------------
-sec "Temp & Caches"
-find /tmp -xdev -type f -atime +1 -not -name 'sess_*' -delete 2>/dev/null || true
-find /var/tmp -xdev -type f -atime +1 -delete 2>/dev/null || true
-find /tmp     -xdev -type f -size +50M -not -name 'sess_*' -delete 2>/dev/null || true
-find /var/tmp -xdev -type f -size +50M -delete 2>/dev/null || true
-find /var/cache -xdev -type f -mtime +1 -delete 2>/dev/null || true
+# ============ 临时/缓存（排除 PHP 会话）=========== #
+ttl "临时与缓存（安全）"
+NI "find /tmp -xdev -type f -atime +1 -not -name 'sess_*' -delete 2>/dev/null || true"
+NI "find /var/tmp -xdev -type f -atime +1 -delete 2>/dev/null || true"
+NI "find /tmp     -xdev -type f -size +50M -not -name 'sess_*' -delete 2>/dev/null || true"
+NI "find /var/tmp -xdev -type f -size +50M -delete 2>/dev/null || true"
+NI "find /var/cache -xdev -type f -mtime +1 -delete 2>/dev/null || true"
 rm -rf /var/crash/* /var/lib/systemd/coredump/* 2>/dev/null || true
-ok "Temp & caches cleaned"
+ok "临时/缓存清理完成"
 
-# -------------------- Package Caches -------------------------
-sec "Package Caches (APT/Snap/Lang)"
+# ============ 包管理缓存 =========== #
+ttl "包管理缓存（APT / Snap / 语言包）"
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get -y autoremove  >/dev/null 2>&1 || true
-  apt-get -y autoclean   >/dev/null 2>&1 || true
-  apt-get -y clean       >/dev/null 2>&1 || true
+  apt-get -y autoremove >/dev/null 2>&1 || true
+  apt-get -y autoclean  >/dev/null 2>&1 || true
+  apt-get -y clean      >/dev/null 2>&1 || true
   dpkg -l | awk '/^rc/{print $2}' | xargs -r dpkg -P >/dev/null 2>&1 || true
 fi
 if command -v snap >/dev/null 2>&1; then
   snap list --all | awk '/disabled/{print $1, $3}' | xargs -r -n2 snap remove || true
 fi
 command -v pip >/dev/null      && pip cache purge >/dev/null 2>&1 || true
-command -v npm >/dev/null      && npm cache clean --force >/devnull 2>&1 || true
+command -v npm >/dev/null      && npm cache clean --force >/dev/null 2>&1 || true
 command -v yarn >/dev/null     && yarn cache clean >/dev/null 2>&1 || true
 command -v composer >/dev/null && composer clear-cache >/dev/null 2>&1 || true
 command -v gem >/dev/null      && gem cleanup -q >/dev/null 2>&1 || true
-ok "Package caches cleaned"
+ok "包管理缓存清理完成"
 
-# --------------------- Containers Clean ----------------------
-sec "Containers (Docker/containerd)"
+# ============ 容器清理（不动业务卷绑定）=========== #
+ttl "容器清理（Docker / containerd）"
 if command -v docker >/dev/null 2>&1; then
-  docker builder prune -af >/dev/null 2>&1 || true
-  docker image   prune -af --filter 'until=168h' >/dev/null 2>&1 || true
-  docker container prune -f --filter 'until=24h' >/dev/null 2>&1 || true
-  docker volume  prune -f >/dev/null 2>&1 || true
-  docker network prune -f >/dev/null 2>&1 || true
-  docker system  prune -af --volumes >/dev/null 2>&1 || true
+  NI "docker builder prune -af >/dev/null 2>&1 || true"
+  NI "docker image prune   -af --filter 'until=168h' >/dev/null 2>&1 || true"
+  NI "docker container prune -f --filter 'until=24h' >/dev/null 2>&1 || true"
+  NI "docker volume prune -f  >/dev/null 2>&1 || true"
+  NI "docker network prune -f >/dev/null 2>&1 || true"
+  NI "docker system prune -af --volumes >/dev/null 2>&1 || true"
 fi
-command -v ctr >/dev/null 2>&1 && ctr -n k8s.io images prune >/dev/null 2>&1 || true
-ok "Containers cleaned"
+command -v ctr >/dev/null 2>&1 && NI "ctr -n k8s.io images prune >/dev/null 2>&1 || true"
+ok "容器清理完成"
 
-# ------------- Backups & All Downloads (wipe) ---------------
-sec "Backups & User Downloads (wipe all)"
-[[ -d /www/server/backup ]] && rm -rf /www/server/backup/* 2>/dev/null || true
-[[ -d /root/Downloads    ]] && rm -rf /root/Downloads/* 2>/dev/null || true
-for d in /home/*/Downloads; do [[ -d "$d" ]] && rm -rf "$d"/* 2>/dev/null || true; done
-# common archives in home dirs
+# ============ 备份 & 用户 Downloads —— 全量删除（不限大小）=========== #
+ttl "备份 & 用户下载（不限大小，全清）"
+[[ -d /www/server/backup ]] && NI "rm -rf /www/server/backup/* 2>/dev/null || true"
+[[ -d /root/Downloads    ]] && NI "rm -rf /root/Downloads/* 2>/dev/null || true"
+for d in /home/*/Downloads; do [[ -d "$d" ]] && NI "rm -rf '$d'/* 2>/dev/null || true"; done
+# 家目录里的常见压缩/备份包
 for base in /root /home/*; do
   [[ -d "$base" ]] || continue
-  find "$base" -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.rar" -o -name "*.7z" -o -name "*.bak" \) -delete 2>/dev/null || true
+  NI "find '$base' -type f \\( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.rar' -o -name '*.7z' -o -name '*.bak' \\) -delete 2>/dev/null || true"
 done
-ok "Backups & Downloads wiped"
+ok "备份 & 下载清空完成"
 
-# --------------- Large files (safe paths) -------------------
-sec "Large Files Sweep (>100MB, safe paths)"
+# ============ 大文件补充（安全路径 >100MB）=========== #
+ttl "大文件补充（安全路径 >100MB）"
 SAFE_BASES=(/tmp /var/tmp /var/cache /var/backups /root /home /www/server/backup)
 for base in "${SAFE_BASES[@]}"; do
   [[ -d "$base" ]] || continue
   while IFS= read -r -d '' f; do
     is_excluded "$f" && continue
-    rm -f "$f" 2>/dev/null || true
+    NI "rm -f '$f' 2>/dev/null || true"
   done < <(find "$base" -xdev -type f -size +100M -print0 2>/dev/null)
 done
-ok "Large files removed"
+ok "大文件清理完成"
 
-# --------------------- Old Kernels ---------------------------
-sec "Old Kernels (keep current + latest)"
+# ============ 旧内核（保留当前+最新）=========== #
+ttl "旧内核（保留当前 + 最新）"
 if command -v dpkg >/dev/null 2>&1; then
   CURK="$(uname -r)"
   mapfile -t KS < <(dpkg -l | awk '/linux-image-[0-9]/{print $2}' | sort -V)
@@ -137,97 +141,144 @@ if command -v dpkg >/dev/null 2>&1; then
   LATEST="$(printf "%s\n" "${KS[@]}" | grep -v "$CURK" | tail -n1 || true)"
   [[ -n "${LATEST:-}" ]] && KEEP+=("$LATEST")
   PURGE=(); for k in "${KS[@]}"; do [[ " ${KEEP[*]} " == *" $k "* ]] || PURGE+=("$k"); done
-  ((${#PURGE[@]})) && apt-get -y purge "${PURGE[@]}" >/dev/null 2>&1 || true
+  ((${#PURGE[@]})) && NI "apt-get -y purge ${PURGE[*]} >/dev/null 2>&1 || true"
 fi
-ok "Kernel cleanup done"
+ok "内核清理完成"
 
-# ----------------- Memory/CPU (safe mode) -------------------
-sec "Memory/CPU (safe)"
-# Only do light cache drop when load low and MemAvailable >=30%
-LOAD1_INT=$(awk '{printf "%d",$1}' /proc/loadavg)
-MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
-MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-MEM_AVAIL_PCT=$(( MEM_AVAIL_KB*100 / MEM_TOTAL_KB ))
-if (( LOAD1_INT <= 2 && MEM_AVAIL_PCT >= 30 )); then
+# ============ 内存/CPU（温和）=========== #
+ttl "内存/CPU 优化（温和）"
+LOAD1=$(awk '{print int($1)}' /proc/loadavg)
+AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+AVAIL_PCT=$(( AVAIL_KB*100 / TOTAL_KB ))
+if (( LOAD1 <= 2 && AVAIL_PCT >= 30 )); then
   sync
   echo 1 > /proc/sys/vm/drop_caches || true
   [[ -w /proc/sys/vm/compact_memory ]] && echo 1 > /proc/sys/vm/compact_memory || true
-  ok "Light cache drop done (Load1=${LOAD1_INT}, MemAvail=${MEM_AVAIL_PCT}%)"
+  ok "回收完成（Load1=${LOAD1}, 可用内存=${AVAIL_PCT}%）"
 else
-  warn "Skipped (Load1=${LOAD1_INT}, MemAvail=${MEM_AVAIL_PCT}%)"
+  warn "跳过（Load1=${LOAD1}, 可用内存=${AVAIL_PCT}%）"
 fi
 
-# ---------------- Intelligent Swap (SAFE) -------------------
-sec "Swap (intelligent; non-disruptive)"
-# If swap exists, keep it (no swapoff). If not, create new file swap.
-has_active_swap(){ grep -q ' swap ' /proc/swaps 2>/dev/null; }
+# ============ 智能 Swap：只保留 1 个；无则新建；去重 fstab =========== #
+ttl "Swap 管理（智能去重，只保留 1 个）"
+has_swap(){ grep -q ' swap ' /proc/swaps 2>/dev/null; }
 calc_target_mib(){
   local mem_mib avail_mib target maxsafe
-  mem_mib=$(awk '/MemTotal/ {printf "%.0f",$2/1024}' /proc/meminfo)        # MiB
-  target=$(( mem_mib / 2 ))                                                # half RAM
+  mem_mib=$(awk '/MemTotal/ {printf "%.0f",$2/1024}' /proc/meminfo)  # MiB
+  target=$(( mem_mib / 2 ))
   (( target < 256 ))  && target=256
   (( target > 2048 )) && target=2048
-  avail_mib=$(df -Pm / | awk 'NR==2{print $4}')                             # MiB
-  maxsafe=$(( avail_mib * 75 / 100 ))                                       # keep >=25% free
+  avail_mib=$(df -Pm / | awk 'NR==2{print $4}')
+  maxsafe=$(( avail_mib * 75 / 100 ))
   (( target > maxsafe )) && target=$maxsafe
   echo "$target"
 }
-mk_swapfile(){
+mk_swap(){
   local path="$1" size="$2"
-  [[ -z "$size" || "$size" -lt 128 ]] && { warn "Insufficient disk to create swap"; return 1; }
+  [[ -z "$size" || "$size" -lt 128 ]] && { warn "磁盘不足，跳过新建 swap"; return 1; }
   local fs; fs=$(stat -f -c %T / 2>/dev/null || echo "")
-  if [[ "$fs" == "btrfs" ]]; then
-    touch "$path"
-    chattr +C "$path" 2>/dev/null || true
-  fi
+  if [[ "$fs" == "btrfs" ]]; then touch "$path"; chattr +C "$path" 2>/dev/null || true; fi
   if ! fallocate -l ${size}M "$path" 2>/dev/null; then
     dd if=/dev/zero of="$path" bs=1M count=${size} status=none conv=fsync
   fi
-  chmod 600 "$path"
-  mkswap "$path" >/dev/null
-  swapon "$path"
+  chmod 600 "$path"; mkswap "$path" >/dev/null; swapon "$path"
   sed -i '\|/swapfile|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
   echo "$path none swap sw 0 0" >> /etc/fstab
-  ok "Swap enabled: $path (${size}MiB)"
+  ok "已启用 swap：$path (${size}MiB)"
+  return 0
 }
 
-if has_active_swap; then
-  ok "Swap already active; leaving as-is"
+# 1) 若无 swap，则新建（优先 /swapfile，busy 就 /swapfile-TS）
+if ! has_swap; then
+  SIZE=$(calc_target_mib)
+  if ! mk_swap "/swapfile" "$SIZE"; then
+    TS=$(date +%s); mk_swap "/swapfile-${TS}" "$SIZE" || warn "无法创建文件型 swap；可考虑 zram"
+  fi
 else
-  TARGET=$(calc_target_mib)
-  if [[ -n "$TARGET" && "$TARGET" -ge 128 ]]; then
-    if ! mk_swapfile "/swapfile" "$TARGET"; then
-      TS=$(date +%s)
-      mk_swapfile "/swapfile-${TS}" "$TARGET" || warn "Failed to add file swap; consider zram"
+  ok "已检测到 swap：保持运行中的 swap"
+fi
+
+# 2) fstab 去重：只保留 1 条（优先保留 zram；否则保留容量最大/优先级最高的）
+#    运行态清理：若启用了多个 swap，则在“可用内存 ≥ 40%”时，逐个安全关闭多余的
+# 2.1 解析当前启用的 swap 列表
+ACTIVE_LIST=$(swapon --show=NAME,PRIO,SIZE --bytes --noheadings 2>/dev/null || true)
+# 2.2 选择保留项（KEEP_PATH）
+KEEP_PATH=""
+if echo "$ACTIVE_LIST" | grep -q 'zram'; then
+  KEEP_PATH=$(echo "$ACTIVE_LIST" | awk '/zram/{print $1; exit}')
+else
+  # 选择：优先级高的；若相同，选择 SIZE 最大的
+  KEEP_PATH=$(echo "$ACTIVE_LIST" | awk '{printf "%s %s %s\n",$1,$2,$3}' \
+    | sort -k2,2nr -k3,3nr | awk 'NR==1{print $1}')
+fi
+if [[ -n "$KEEP_PATH" ]]; then
+  ok "保留运行中的 swap：$KEEP_PATH"
+else
+  warn "未能解析保留 swap（可能当前无 swap）"
+fi
+
+# 2.3 fstab 归一化：只保留 KEEP_PATH
+if [[ -f /etc/fstab ]]; then
+  cp /etc/fstab /etc/fstab.bak.deepclean 2>/dev/null || true
+  # 删除所有 swapfile 条目
+  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|/swapfile |d'       /etc/fstab 2>/dev/null || true
+  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
+  # 写回保留项（如果存在）
+  if [[ -n "$KEEP_PATH" ]]; then
+    echo "$KEEP_PATH none swap sw 0 0" >> /etc/fstab
+  fi
+  ok "fstab 已去重（备份：/etc/fstab.bak.deepclean）"
+fi
+
+# 2.4 运行态多余 swap：仅在内存充足时，逐个关闭并删除文件型多余 swap
+AVAIL_PCT=$(( AVAIL_KB*100 / TOTAL_KB ))
+if [[ -n "$ACTIVE_LIST" ]]; then
+  # 列出除 KEEP_PATH 外的其它 swap
+  OTHERS=$(echo "$ACTIVE_LIST" | awk -v keep="$KEEP_PATH" '{if($1!=keep)print $1}')
+  if [[ -n "$OTHERS" ]]; then
+    if (( AVAIL_PCT >= 40 )); then
+      while read -r dev; do
+        [[ -z "$dev" ]] && continue
+        if [[ "$dev" == /dev/zram* ]]; then
+          # 不强关 zram（稳定为先）
+          warn "保留额外 zram：$dev（未强制关闭）"
+        else
+          # 安全关闭并删除文件型 swap
+          swapoff "$dev" 2>/dev/null || true
+          rm -f "$dev"   2>/dev/null || true
+          ok "已关闭并移除多余 swap：$dev"
+        fi
+      done <<< "$OTHERS"
+    else
+      warn "可用内存不足（${AVAIL_PCT}%），暂不关闭多余 swap（已在 fstab 去重，重启后只保留 1 个）"
     fi
-  else
-    warn "Disk too low to create swap; skipping"
   fi
 fi
 
-# ---------------------- Disk TRIM ----------------------------
-sec "Disk Optimize (TRIM if available)"
+# ============ TRIM =========== #
+ttl "磁盘优化（TRIM）"
 if command -v fstrim >/dev/null 2>&1; then
-  fstrim -av >/dev/null 2>&1 || true
-  ok "TRIM done"
+  NI "fstrim -av >/dev/null 2>&1 || true"
+  ok "TRIM 完成"
 else
-  warn "fstrim not available"
+  warn "未检测到 fstrim"
 fi
 
-# ---------------------- Final Summary -----------------------
-sec "System Status (After)"
-echo "[Disk (/)]"; df -h /
-echo
-echo "[Memory]"; free -h
-echo
-echo "[Swap]"; { swapon --show || true; } | sed 's/^/  /' || true
-ok "Deep clean finished"
+# ============ 状态（后）=========== #
+ttl "系统概况（清理后）"
+log "磁盘（/）："; df -h / | sed 's/^/  /'
+log "内存：";      free -h  | sed 's/^/  /'
+log "Swap：";     (swapon --show || true) | sed 's/^/  /' || true
+ok "深度清理完成 🎉"
 
-# ----------------------- Cron daily -------------------------
-sec "Cron"
+# ============ 定时任务 =========== #
+ttl "计划任务"
 chmod +x /root/deep-clean.sh
 ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true; echo "0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1" ) | crontab -u root -
-ok "Scheduled daily at 03:00"
+ok "已设置每日 03:00 自动清理（03:00）"
 EOF
 
 chmod +x "$SCRIPT_PATH"
