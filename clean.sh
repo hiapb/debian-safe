@@ -9,13 +9,12 @@
 # - 强保护：宝塔/站点/数据库/PHP/session
 # ======================================================================
 
-set -e
-SCRIPT_PATH="/root/deep-clean.sh"
-echo "📝 正在写入111/覆盖 $SCRIPT_PATH ..."
-
-cat > "$SCRIPT_PATH" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
+set -e 
+SCRIPT_PATH="/root/deep-clean.sh" 
+echo "📝 写入/覆盖 $SCRIPT_PATH ..." 
+cat > "$SCRIPT_PATH" <<'EOF' 
+#!/usr/bin/env bash 
+set -Eeuo pipefail 
 IFS=$'\n\t'
 
 # ===== 彩色输出 =====
