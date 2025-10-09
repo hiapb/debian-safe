@@ -32,43 +32,32 @@ EXCLUDES=(
 )
 is_excluded(){ local p="$1"; for e in "${EXCLUDES[@]}"; do [[ "$p" == "$e"* ]] && return 0; done; return 1; }
 
-# ====== 工具与平台识别（修正版）======
-PKG=""
-HAS_APT=0
-HAS_DNF=0
-
+# ====== 工具与平台识别（稳妥版：不用算术判断）======
+PKG="unknown"
 if command -v apt-get >/dev/null 2>&1; then
-  PKG="apt"; HAS_APT=1
-fi
-
-if command -v dnf >/dev/null 2>&1; then
-  PKG="dnf"; HAS_DNF=1
-fi
-
-# 如果没有 apt/dnf，但有 yum（老系统/RHEL系）
-if command -v yum >/dev/null 2>&1 && [ "$HAS_APT" -eq 0 ] && [ "$HAS_DNF" -eq 0 ]; then
-  PKG="yum"; HAS_DNF=1
+  PKG="apt"
+elif command -v dnf >/dev/null 2>&1; then
+  PKG="dnf"
+elif command -v yum >/dev/null 2>&1; then
+  PKG="yum"
 fi
 
 is_vm(){ command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; } # 0=虚机
+NI(){ nice -n 19 ionice -c3 bash -c "$*"; }  # 低优先级执行
 
-# 通用低优先级执行
-NI(){ nice -n 19 ionice -c3 bash -c "$*"; }
-
-# 包是否存在
+# 包是否存在（按系分流）
 dpkg_has(){ dpkg -s "$1" >/dev/null 2>&1; }
 rpm_has(){ rpm -q "$1" >/dev/null 2>&1; }
 
-# 安全卸载（按发行版）
+# 安全卸载（适配 apt/dnf/yum）
 pkg_purge(){
-  local p
   for p in "$@"; do
     case "$PKG" in
       apt)
         dpkg_has "$p" && apt-get -y purge "$p" >/dev/null 2>&1 || true
         ;;
       dnf|yum)
-        rpm_has "$p" && (dnf -y remove "$p" >/dev/null 2>&1 || yum -y remove "$p" >/devnull 2>&1 || yum -y remove "$p" >/dev/null 2>&1) || true
+        rpm_has "$p" && (dnf -y remove "$p" >/dev/null 2>&1 || yum -y remove "$p" >/dev/null 2>&1) || true
         ;;
     esac
   done
@@ -81,8 +70,8 @@ log "磁盘占用（根分区）："; df -h / | sed 's/^/  /'
 log "内存占用："; free -h | sed 's/^/  /'
 ok "概况完成"
 
-# ====== APT/Dpkg 锁处理（Deb/Ub）======
-if [ "$HAS_APT" -eq 1 ]; then
+# ====== APT/Dpkg 锁处理（仅 Deb/Ub）======
+if command -v apt-get >/dev/null 2>&1; then
   title "🔒 进程清理" "释放 APT/Dpkg 锁"
   pkill -9 -f 'apt|apt-get|dpkg|unattended-upgrade' 2>/dev/null || true
   rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock || true
@@ -114,19 +103,17 @@ ok "临时/缓存清理完成"
 
 # ====== 包缓存 & 历史清理（跨发行版）======
 title "📦 包缓存" "APT/DNF 历史与缓存深度清理"
-if [ "$HAS_APT" -eq 1 ]; then
+if [ "$PKG" = "apt" ]; then
   systemctl stop apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer >/dev/null 2>&1 || true
   apt-get -y autoremove --purge  >/dev/null 2>&1 || true
   apt-get -y autoclean           >/dev/null 2>&1 || true
   apt-get -y clean               >/dev/null 2>&1 || true
   dpkg -l 2>/dev/null | awk '/^rc/{print $2}' | xargs -r dpkg -P >/dev/null 2>&1 || true
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/cache/apt/archives/partial 2>/dev/null || true
-  # 非当前 headers/modules-extra
   CURK="$(uname -r)"
   dpkg -l | awk '/^ii\s+linux-(headers|modules-extra)-/{print $2}' | grep -v "$CURK" \
     | xargs -r apt-get -y purge >/dev/null 2>&1 || true
-fi
-if [ "$HAS_DNF" -eq 1 ]; then
+elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
   (dnf -y autoremove >/dev/null 2>&1 || yum -y autoremove >/dev/null 2>&1 || true)
   (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/dev/null 2>&1 || true)
   rm -rf /var/cache/dnf/* /var/cache/yum/* 2>/dev/null || true
@@ -136,14 +123,13 @@ ok "包缓存/历史清理完成"
 
 # ====== 组件裁剪：跨发行版“非必需”组件 ======
 title "✂️ 组件裁剪" "移除非必需工具包（服务器极简）"
-if [ "$HAS_APT" -eq 1 ]; then
+if [ "$PKG" = "apt" ]; then
   pkg_purge snapd cloud-init apport whoopsie popularity-contest \
             landscape-client ubuntu-advantage-tools update-notifier unattended-upgrades
   pkg_purge cockpit cockpit-ws cockpit-system \
             avahi-daemon cups* modemmanager network-manager* plymouth* fwupd* \
             printer-driver-* xserver-xorg* x11-* wayland* *-doc
-fi
-if [ "$HAS_DNF" -eq 1 ]; then
+elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
   pkg_purge cloud-init subscription-manager insights-client \
             cockpit cockpit-ws cockpit-system \
             abrt* sos* avahi* cups* modemmanager NetworkManager* plymouth* fwupd* \
@@ -215,7 +201,7 @@ ok "大文件补充清理完成"
 
 # ====== 旧内核（保留当前+最新）======
 title "🧰 内核清理" "仅保留当前与最新版本"
-if [ "$HAS_APT" -eq 1 ]; then
+if [ "$PKG" = "apt" ]; then
   CURK="$(uname -r)"
   mapfile -t KS < <(dpkg -l | awk '/linux-image-[0-9]/{print $2}' | sort -V)
   KEEP=("linux-image-${CURK}")
@@ -223,8 +209,7 @@ if [ "$HAS_APT" -eq 1 ]; then
   [[ -n "${LATEST:-}" ]] && KEEP+=("$LATEST")
   PURGE=(); for k in "${KS[@]}"; do [[ " ${KEEP[*]} " == *" $k "* ]] || PURGE+=("$k"); done
   ((${#PURGE[@]})) && NI "apt-get -y purge ${PURGE[*]} >/dev/null 2>&1 || true"
-fi
-if [ "$HAS_DNF" -eq 1 ]; then
+elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
   CURK_ESC="$(uname -r | sed 's/\./\\./g')"
   mapfile -t RMK < <(rpm -q kernel-core kernel | grep -vE "$CURK_ESC" | sort -V | head -n -1 || true)
   ((${#RMK[@]})) && (dnf -y remove "${RMK[@]}" >/dev/null 2>&1 || yum -y remove "${RMK[@]}" >/dev/null 2>&1 || true)
