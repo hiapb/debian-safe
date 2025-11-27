@@ -15,6 +15,9 @@ IFS=$'\n\t'
 
 # ====== 美观输出 ======
 C0="\033[0m"; B="\033[1m"; BLU="\033[38;5;33m"; GRN="\033[38;5;40m"; YEL="\033[38;5;178m"; RED="\033[38;5;196m"; CYA="\033[36m"; GY="\033[90m"
+# 兼容你想用的颜色变量名
+GREEN="$GRN"; YELLOW="$YEL"; RESET="$C0"
+
 hr(){ printf "${GY}%s${C0}\n" "────────────────────────────────────────────────────────"; }
 title(){ printf "\n${B}${BLU}[%s]${C0} %s\n" "$1" "$2"; hr; }
 ok(){ printf "${GRN}✔${C0} %s\n" "$*"; }
@@ -22,6 +25,17 @@ warn(){ printf "${YEL}⚠${C0} %s\n" "$*"; }
 err(){ printf "${RED}✘${C0} %s\n" "$*"; }
 log(){ printf "${CYA}•${C0} %s\n" "$*"; }
 trap 'err "出错：行 $LINENO"; exit 1' ERR
+
+# ====== 开始安全确认（你要求的部分）======
+echo -e "${GREEN}🧹 一键深度清理...${RESET}"
+echo -e "${YELLOW}⚠️  此操作将清理系统缓存与依赖，仅建议在节点机执行。${RESET}"
+echo -e "${RED}⚠️  非节点机执行可能影响系统或服务，请谨慎确认！${RESET}"
+read -rp "是否继续执行深度清理？[y/N]: " confirm
+
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  echo -e "${RED}❌ 已取消清理操作。${RESET}"
+  exit 0
+fi
 
 # ====== 保护路径（绝不触碰）======
 EXCLUDES=(
@@ -42,7 +56,7 @@ elif command -v yum >/dev/null 2>&1; then
   PKG="yum"
 fi
 
-is_vm(){ command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; } # 0=虚机
+is_vm(){ command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet; }  # 0=虚机
 NI(){ nice -n 19 ionice -c3 bash -c "$*"; }  # 低优先级执行
 
 # 包是否存在（按系分流）
@@ -187,7 +201,7 @@ for base in /root /home/*; do
 done
 ok "备份与用户下载清空完成"
 
-# ====== 大文件补充（安全路径 >150MB）======
+# ====== 大文件补充（安全路径 >50MB）======
 title "🪣 大文件清理" "安全目录下清除 >50MB"
 SAFE_BASES=(/tmp /var/tmp /var/cache /var/backups /root /home /www/server/backup)
 for base in "${SAFE_BASES[@]}"; do
@@ -195,7 +209,7 @@ for base in "${SAFE_BASES[@]}"; do
   while IFS= read -r -d '' f; do
     is_excluded "$f" && continue
     NI "rm -f '$f' 2>/dev/null || true"
-  done < <(find "$base" -xdev -type f -size +50 -print0 2>/dev/null)
+  done < <(find "$base" -xdev -type f -size +50M -print0 2>/dev/null)
 done
 ok "大文件补充清理完成"
 
@@ -216,21 +230,33 @@ elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
 fi
 ok "内核清理完成"
 
-# ====== 内存/CPU 优化（深度）======
-title "⚡ 内存优化" "低负载回收缓存"
+# ====== 内存/CPU 优化（更激进版）======
+title "⚡ 内存优化" "强制回收缓存并紧凑内存"
 LOAD1=$(awk '{print int($1)}' /proc/loadavg)
 MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
 PCT=$(( MEM_AVAIL_KB*100 / MEM_TOTAL_KB ))
-if (( LOAD1 <= 2 && PCT >= 30 )); then
-  log "条件满足(Load1=${LOAD1}, MemAvail=${PCT}%)，执行回收"
-  sync
-  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-  [[ -w /proc/sys/vm/compact_memory ]] && echo 1 > /proc/sys/vm/compact_memory || true
-  sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
-  ok "内存/CPU 回收完成"
+
+log "当前负载：Load1=${LOAD1}，可用内存约 ${PCT}%"
+if (( LOAD1 >= 8 )); then
+  warn "当前负载过高（>=8），为避免系统瞬间卡死，暂时跳过内存强制回收"
 else
-  warn "跳过回收（Load1=${LOAD1}, MemAvail=${PCT}%），避免卡顿/断连"
+  log "同步磁盘并强制丢弃页缓存/目录项/索引节点..."
+  sync
+  # 多次尝试，尽可能把能回收的都回收
+  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  sleep 1
+  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+  # 内存紧凑，减少碎片
+  if [[ -w /proc/sys/vm/compact_memory ]]; then
+    echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+  fi
+
+  # 降低 swap 使用倾向
+  sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+
+  ok "内存/CPU 回收完成（已强制 drop_caches & compact_memory）"
 fi
 
 # ====== Swap 策略（内存≥2G 禁用；<2G 单一 /swapfile）======
