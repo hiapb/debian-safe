@@ -26,7 +26,11 @@ err(){ printf "${RED}✘${C0} %s\n" "$*"; }
 log(){ printf "${CYA}•${C0} %s\n" "$*"; }
 trap 'err "出错：行 $LINENO"; exit 1' ERR
 
-# ====== 开始安全确认（支持自动模式）======
+# 模式开关（默认都关）
+FORCE_MEM_CLEAN=0        # 强制内存深度清理
+FORCE_RESTART_SERVICES=0 # 重启所有非核心服务
+
+# ====== 开始安全确认（支持自动模式 + 强制模式）======
 if [[ -t 0 ]]; then
   # 有终端：说明是人手动执行，弹确认
   echo -e "${GREEN}🧹 一键深度清理...${RESET}"
@@ -38,11 +42,30 @@ if [[ -t 0 ]]; then
     echo -e "${RED}❌ 已取消清理操作。${RESET}"
     exit 0
   fi
-else
-  # 没有终端：大概率是 crontab/自动任务，自动放行
-  echo -e "${YELLOW}⚠️ 检测到非交互环境（如 crontab），自动跳过确认并执行深度清理...${RESET}"
-fi
 
+  # 第二问：是否启用【强制模式 = 强制内存清理 + 重启所有非核心服务】
+  echo
+  echo -e "${YELLOW}⚠️  可选：启用【强制模式】=${RESET}"
+  echo -e "${YELLOW}    1）更激进的内存深度清理（多次 drop_caches 等）${RESET}"
+  echo -e "${YELLOW}    2）重启所有非核心 systemd 服务（站点/数据库等统统重启）${RESET}"
+  echo -e "${RED}⚠️  敢选“是”就默认你这台机没有重要业务，请自行承担风险。${RESET}"
+  read -rp "是否启用强制模式（强制内存 + 重启所有非核心服务）？[y/N]: " force_mode
+
+  if [[ "$force_mode" =~ ^[Yy]$ ]]; then
+    FORCE_MEM_CLEAN=1
+    FORCE_RESTART_SERVICES=1
+    echo -e "${GREEN}✅ 已开启【强制模式】（内存深度清理 + 重启所有非核心服务）。${RESET}"
+  else
+    FORCE_MEM_CLEAN=0
+    FORCE_RESTART_SERVICES=0
+    echo -e "${YELLOW}ℹ️ 使用普通模式：不重启服务，内存清理相对温和。${RESET}"
+  fi
+else
+  # 没有终端：大概率是 crontab/自动任务，自动放行，且默认不开任何“危险开关”
+  FORCE_MEM_CLEAN=0
+  FORCE_RESTART_SERVICES=0
+  echo -e "${YELLOW}⚠️ 检测到非交互环境（如 crontab），自动以【普通模式】执行（不强制内存、不重启服务）...${RESET}"
+fi
 
 # ====== 保护路径（绝不触碰）======
 EXCLUDES=(
@@ -136,7 +159,7 @@ if [ "$PKG" = "apt" ]; then
     | xargs -r apt-get -y purge >/dev/null 2>&1 || true
 elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
   (dnf -y autoremove >/dev/null 2>&1 || yum -y autoremove >/dev/null 2>&1 || true)
-  (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/dev/null 2>&1 || true)
+  (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/devnull 2>&1 || true)
   rm -rf /var/cache/dnf/* /var/cache/yum/* 2>/dev/null || true
   pkg_purge dracut-config-rescue >/dev/null 2>&1 || true
 fi
@@ -237,23 +260,41 @@ elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
 fi
 ok "内核清理完成"
 
-# ====== 内存/CPU 优化（更激进版）======
-title "⚡ 内存优化" "强制回收缓存并紧凑内存"
+# ====== 内存/CPU 优化（普通模式 + 强制模式）======
+title "⚡ 内存优化" "回收缓存并紧凑内存"
 LOAD1=$(awk '{print int($1)}' /proc/loadavg)
 MEM_AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
 PCT=$(( MEM_AVAIL_KB*100 / MEM_TOTAL_KB ))
 
 log "当前负载：Load1=${LOAD1}，可用内存约 ${PCT}%"
-if (( LOAD1 >= 8 )); then
-  warn "当前负载过高（>=8），为避免系统瞬间卡死，暂时跳过内存强制回收"
+if (( LOAD1 >= 8 )) && [[ "${FORCE_MEM_CLEAN:-0}" -eq 0 ]]; then
+  # 负载高且未开启强制模式：保护性跳过
+  warn "当前负载过高（>=8），且未启用强制模式，为避免系统瞬间卡死，暂时跳过内存回收"
 else
-  log "同步磁盘并强制丢弃页缓存/目录项/索引节点..."
+  if [[ "${FORCE_MEM_CLEAN:-0}" -eq 1 ]]; then
+    log "已启用【强制内存深度清理】模式：更激进地回收缓存和整理内存，可能短暂卡顿..."
+  else
+    log "使用普通内存清理模式：在当前负载下安全回收缓存"
+  fi
+
+  log "同步磁盘并丢弃页缓存/目录项/索引节点..."
   sync
-  # 多次尝试，尽可能把能回收的都回收
-  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-  sleep 1
-  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+  if [[ "${FORCE_MEM_CLEAN:-0}" -eq 1 ]]; then
+    # 强制模式：多次 drop_caches，配合高 vfs_cache_pressure
+    sysctl -w vm.vfs_cache_pressure=200 >/dev/null 2>&1 || true
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 1
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 1
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    # 恢复一个相对合理的 vfs_cache_pressure
+    sysctl -w vm.vfs_cache_pressure=100 >/dev/null 2>&1 || true
+  else
+    # 普通模式：一次即可，温和一点
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  fi
 
   # 内存紧凑，减少碎片
   if [[ -w /proc/sys/vm/compact_memory ]]; then
@@ -263,7 +304,67 @@ else
   # 降低 swap 使用倾向
   sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
 
-  ok "内存/CPU 回收完成（已强制 drop_caches & compact_memory）"
+  ok "内存/CPU 回收完成（模式：$([[ "${FORCE_MEM_CLEAN:-0}" -eq 1 ]] && echo 强制 || echo 普通)）"
+fi
+
+# ====== 可选：重启所有非核心服务 ======
+if [[ "${FORCE_RESTART_SERVICES:-0}" -eq 1 ]]; then
+  title "🔃 服务重启" "重启所有非核心 systemd 服务以最大化释放内存"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "系统无 systemctl，无法自动重启服务，已跳过此步骤。"
+  else
+    # 核心服务白名单（永不重启，避免断网/断连/核心崩溃）
+    CORE_SERVICES=(
+      systemd
+      systemd-journald
+      systemd-logind
+      systemd-udevd
+      systemd-networkd
+      systemd-resolved
+      dbus
+      sshd
+      ssh
+      networkd
+      NetworkManager
+      networking
+      rsyslog
+      cron
+      crond
+      polkit
+    )
+
+    log "获取系统所有正在运行或已启用的服务 ..."
+    SERVICES=$(systemctl list-units --type=service --state=running,enabled --no-pager --no-legend \
+      | awk '{print $1}' | sed 's/\.service$//')
+
+    for svc in $SERVICES; do
+      [[ -z "$svc" ]] && continue
+
+      # 判断是否在核心白名单
+      skip=0
+      for core in "${CORE_SERVICES[@]}"; do
+        if [[ "$svc" == "$core"* ]]; then
+          skip=1
+          break
+        fi
+      done
+      if [[ "$skip" -eq 1 ]]; then
+        log "跳过核心服务：$svc"
+        continue
+      fi
+
+      log "重启服务：$svc"
+      if systemctl restart "$svc" 2>/dev/null; then
+        ok "服务已重启：$svc"
+      else
+        warn "重启失败：$svc（已跳过）"
+      fi
+    done
+  fi
+else
+  title "🔃 服务重启" "未启用服务重启选项，跳过"
+  log "如需释放更多内存，下次可启用【强制模式】重启所有非核心服务。"
 fi
 
 # ====== Swap 策略（内存≥2G 禁用；<2G 单一 /swapfile）======
