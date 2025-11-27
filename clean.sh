@@ -26,16 +26,23 @@ err(){ printf "${RED}✘${C0} %s\n" "$*"; }
 log(){ printf "${CYA}•${C0} %s\n" "$*"; }
 trap 'err "出错：行 $LINENO"; exit 1' ERR
 
-# ====== 开始安全确认（你要求的部分）======
-echo -e "${GREEN}🧹 一键深度清理...${RESET}"
-echo -e "${YELLOW}⚠️  此操作将清理系统缓存与依赖，仅建议在节点机执行。${RESET}"
-echo -e "${RED}⚠️  非节点机执行可能影响系统或服务，请谨慎确认！${RESET}"
-read -rp "是否继续执行深度清理？[y/N]: " confirm
+# ====== 开始安全确认（支持自动模式）======
+if [[ -t 0 ]]; then
+  # 有终端：说明是人手动执行，弹确认
+  echo -e "${GREEN}🧹 一键深度清理...${RESET}"
+  echo -e "${YELLOW}⚠️  此操作将清理系统缓存与依赖，仅建议在节点机执行。${RESET}"
+  echo -e "${RED}⚠️  非节点机执行可能影响系统或服务，请谨慎确认！${RESET}"
+  read -rp "是否继续执行深度清理？[y/N]: " confirm
 
-if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-  echo -e "${RED}❌ 已取消清理操作。${RESET}"
-  exit 0
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo -e "${RED}❌ 已取消清理操作。${RESET}"
+    exit 0
+  fi
+else
+  # 没有终端：大概率是 crontab/自动任务，自动放行
+  echo -e "${YELLOW}⚠️ 检测到非交互环境（如 crontab），自动跳过确认并执行深度清理...${RESET}"
 fi
+
 
 # ====== 保护路径（绝不触碰）======
 EXCLUDES=(
