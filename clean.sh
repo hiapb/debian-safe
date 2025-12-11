@@ -159,7 +159,7 @@ if [ "$PKG" = "apt" ]; then
     | xargs -r apt-get -y purge >/dev/null 2>&1 || true
 elif [ "$PKG" = "dnf" ] || [ "$PKG" = "yum" ]; then
   (dnf -y autoremove >/dev/null 2>&1 || yum -y autoremove >/dev/null 2>&1 || true)
-  (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/devnull 2>&1 || true)
+  (dnf -y clean all >/dev/null 2>&1 || yum -y clean all >/dev/null 2>&1 || true)
   rm -rf /var/cache/dnf/* /var/cache/yum/* 2>/dev/null || true
   pkg_purge dracut-config-rescue >/dev/null 2>&1 || true
 fi
