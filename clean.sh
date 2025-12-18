@@ -597,3 +597,4 @@ EOF
 
 chmod +x "$SCRIPT_PATH"
 bash "$SCRIPT_PATH"
+
