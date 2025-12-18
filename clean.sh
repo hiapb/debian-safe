@@ -433,7 +433,8 @@ else
 fi
 
 # ====== Swap 策略（内存≥2G 禁用；<2G 单一 /swapfile）======
-title "💾 Swap 管理" "≥2G禁用；<2G 单一 /swapfile"
+title "💾 Swap 管理" "≥2G禁用；<2G 单一 /swapfile（自动探测宿主机是否允许 swapon）"
+
 calc_target_mib(){
   local mem_kb mib target
   mem_kb="$(grep -E '^MemTotal:' /proc/meminfo | tr -s ' ' | cut -d' ' -f2 2>/dev/null || echo 0)"
@@ -443,8 +444,10 @@ calc_target_mib(){
   (( target>2048 )) && target=2048
   echo "$target"
 }
-active_swaps(){ swapon --show=NAME --noheadings 2>/dev/null | sed '/^$/d'; }
-active_count(){ active_swaps | wc -l | tr -d ' '; }
+
+active_swaps(){ swapon --show=NAME --noheadings 2>/dev/null | sed '/^$/d' || true; }
+active_count(){ active_swaps | wc -l | tr -d ' ' || echo 0; }
+
 normalize_fstab_to_single(){
   sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
   sed -i '\|/swapfile |d' /etc/fstab 2>/dev/null || true
@@ -452,68 +455,115 @@ normalize_fstab_to_single(){
   grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
   ok "fstab 已规范为单一 /swapfile"
 }
-create_single_swapfile(){
-  local target path fs
-  target="$(calc_target_mib)"
-  path="/swapfile"
-  fs="$(stat -f -c %T / 2>/dev/null || echo "")"
-  swapoff "$path" 2>/dev/null || true
-  rm -f "$path" 2>/dev/null || true
-  [[ "$fs" == "btrfs" ]] && { touch "$path"; chattr +C "$path" 2>/dev/null || true; }
-  if ! fallocate -l ${target}M "$path" 2>/dev/null; then
-    dd if=/dev/zero of="$path" bs=1M count=${target} status=none conv=fsync
+
+# 探测：是否允许 swapon（很多 NAT/容器会禁止）
+SWAP_SUPPORTED=1
+probe_swap_support(){
+  local tmp="/swapfile.__probe__"
+  # 必须是 root 且能写 /swapfile
+  [[ "$(id -u)" -eq 0 ]] || return 1
+  # 创建一个最小的 probe swapfile
+  rm -f "$tmp" 2>/dev/null || true
+  if ! fallocate -l 16M "$tmp" 2>/dev/null; then
+    dd if=/dev/zero of="$tmp" bs=1M count=16 status=none conv=fsync 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
   fi
-  chmod 600 "$path"
-  mkswap "$path" >/dev/null
-  swapon "$path"
-  ok "已创建并启用主 swap：$path (${target}MiB)"
-}
-single_path_or_empty(){
-  local n p
-  n="$(active_count)"
-  if [[ "$n" == "1" ]]; then p="$(active_swaps | head -n1)"; echo "$p"; else echo ""; fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mkswap "$tmp" >/dev/null 2>&1 || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+
+  # 关键：尝试 swapon，如果不允许则返回 1
+  if swapon "$tmp" >/dev/null 2>&1; then
+    swapoff "$tmp" >/dev/null 2>&1 || true
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
 }
 
-MEM_MB="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
-if [[ "$MEM_MB" -ge 2048 ]]; then
-  warn "物理内存 ${MEM_MB}MiB ≥ 2048MiB：禁用并移除所有 Swap"
-  for _ in 1 2 3; do
-    LIST="$(active_swaps)"; [[ -z "$LIST" ]] && break
-    while read -r dev; do
-      [[ -z "$dev" ]] && continue
-      swapoff "$dev" 2>/dev/null || true
-      case "$dev" in /dev/*) : ;; *) rm -f "$dev" 2>/dev/null || true ;; esac
-    done <<< "$LIST"
-    sleep 1
-  done
-  rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
-  sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
-  sed -i '\|/swapfile |d' /etc/fstab 2>/dev/null || true
-  sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
-  ok "已禁用并移除 Swap（内存≥2G）"
+if ! probe_swap_support; then
+  SWAP_SUPPORTED=0
+  warn "检测到宿主机禁止 swapon/swapoff（常见于 NAT/容器/Virt 限制），已跳过 Swap 管理，避免脚本中断"
+  log "当前活动 swap："; ( swapon --show || echo "  (none)" ) 2>/dev/null | sed 's/^/  /' || true
 else
-  CNT="$(active_count)"
-  if [[ "$CNT" == "0" ]]; then
-    log "未检测到活动 swap，创建单一 /swapfile ..."
-    create_single_swapfile; normalize_fstab_to_single
-  elif [[ "$CNT" == "1" ]]; then
-    P="$(single_path_or_empty)"; ok "已存在单一 swap：$P（保持不变）"; normalize_fstab_to_single
-  else
-    warn "检测到多个 swap（${CNT} 个），将关闭全部并重建为单一 /swapfile"
+  create_single_swapfile(){
+    local target path fs
+    target="$(calc_target_mib)"
+    path="/swapfile"
+    fs="$(stat -f -c %T / 2>/dev/null || echo "")"
+
+    swapoff "$path" >/dev/null 2>&1 || true
+    rm -f "$path" 2>/dev/null || true
+
+    [[ "$fs" == "btrfs" ]] && { touch "$path"; chattr +C "$path" 2>/dev/null || true; }
+
+    if ! fallocate -l ${target}M "$path" 2>/dev/null; then
+      dd if=/dev/zero of="$path" bs=1M count=${target} status=none conv=fsync 2>/dev/null || true
+    fi
+    chmod 600 "$path" 2>/dev/null || true
+    mkswap "$path" >/dev/null 2>&1 || { warn "mkswap 失败，跳过 swap 创建"; rm -f "$path" 2>/dev/null || true; return 0; }
+
+    if swapon "$path" >/dev/null 2>&1; then
+      ok "已创建并启用主 swap：$path (${target}MiB)"
+    else
+      warn "swapon 被宿主机拒绝（Operation not permitted），已跳过 swap 启用"
+      rm -f "$path" 2>/dev/null || true
+      return 0
+    fi
+  }
+
+  single_path_or_empty(){
+    local n p
+    n="$(active_count)"
+    if [[ "$n" == "1" ]]; then p="$(active_swaps | head -n1)"; echo "$p"; else echo ""; fi
+  }
+
+  MEM_MB="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+  if [[ "$MEM_MB" -ge 2048 ]]; then
+    warn "物理内存 ${MEM_MB}MiB ≥ 2048MiB：禁用并移除所有 Swap（若宿主机允许）"
     for _ in 1 2 3; do
       LIST="$(active_swaps)"; [[ -z "$LIST" ]] && break
       while read -r dev; do
         [[ -z "$dev" ]] && continue
-        swapoff "$dev" 2>/dev/null || true
+        swapoff "$dev" >/dev/null 2>&1 || true
         case "$dev" in /dev/*) : ;; *) rm -f "$dev" 2>/dev/null || true ;; esac
       done <<< "$LIST"
       sleep 1
     done
     rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
-    create_single_swapfile; normalize_fstab_to_single
+    sed -i '\|/swapfile-[0-9]\+|d' /etc/fstab 2>/dev/null || true
+    sed -i '\|/swapfile |d' /etc/fstab 2>/dev/null || true
+    sed -i '\|/dev/zram|d'        /etc/fstab 2>/dev/null || true
+    ok "Swap 处理完成（内存≥2G：尝试禁用/移除）"
+  else
+    CNT="$(active_count)"
+    if [[ "$CNT" == "0" ]]; then
+      log "未检测到活动 swap，创建单一 /swapfile ..."
+      create_single_swapfile
+      normalize_fstab_to_single
+    elif [[ "$CNT" == "1" ]]; then
+      P="$(single_path_or_empty)"
+      ok "已存在单一 swap：$P（保持不变）"
+      normalize_fstab_to_single
+    else
+      warn "检测到多个 swap（${CNT} 个），将尝试关闭全部并重建为单一 /swapfile"
+      for _ in 1 2 3; do
+        LIST="$(active_swaps)"; [[ -z "$LIST" ]] && break
+        while read -r dev; do
+          [[ -z "$dev" ]] && continue
+          swapoff "$dev" >/dev/null 2>&1 || true
+          case "$dev" in /dev/*) : ;; *) rm -f "$dev" 2>/dev/null || true ;; esac
+        done <<< "$LIST"
+        sleep 1
+      done
+      rm -f /swapfile /swapfile-* /swap.emerg 2>/dev/null || true
+      create_single_swapfile
+      normalize_fstab_to_single
+    fi
   fi
+
+  log "当前活动 swap："; ( swapon --show || echo "  (none)" ) 2>/dev/null | sed 's/^/  /' || true
 fi
-log "当前活动 swap："; ( swapon --show || echo "  (none)" ) | sed 's/^/  /'
 
 # ====== 磁盘 TRIM ======
 title "🪶 磁盘优化" "执行 fstrim 提升性能"
