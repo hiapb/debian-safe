@@ -433,7 +433,7 @@ else
 fi
 
 # ====== Swap 策略（内存≥2G 禁用；<2G 单一 /swapfile）======
-title "💾 Swap 管理" "≥2G禁用；<2G 单一 /swapfile（自动探测宿主机是否允许 swapon）"
+title "💾 Swap 管理" "≥2G禁用；<2G 单一 /swapfile"
 
 calc_target_mib(){
   local mem_kb mib target
