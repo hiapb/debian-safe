@@ -24,12 +24,20 @@ err(){ printf "${RED}✘${C0} %s\n" "$*"; }
 log(){ printf "${CYA}•${C0} %s\n" "$*"; }
 trap 'err "出错：行 $LINENO"; exit 1' ERR
 
-# 模式开关（默认都关）
-FORCE_MEM_CLEAN=0        # 强制内存深度清理
-FORCE_RESTART_SERVICES=0 # 重启所有非核心服务
+# ====== 模式开关与参数解析 ======
+FORCE_MEM_CLEAN=0        # 默认关闭强制内存清理
+FORCE_RESTART_SERVICES=0 # 默认关闭服务重启
+CRON_CMD_APPEND=""       # 用于存储定时任务的附加参数
+
+# 监听静默传参（用于 Cron 定时任务触发）
+if [[ "${1:-}" == "--force" ]]; then
+  FORCE_MEM_CLEAN=1
+  FORCE_RESTART_SERVICES=1
+fi
 
 # ====== 开始安全确认（支持自动模式 + 强制模式）======
-if [[ -t 0 ]]; then
+# 判断条件：既要是交互终端 (-t 0)，又不能带有 --force 参数
+if [[ -t 0 && "${1:-}" != "--force" ]]; then
   echo -e "${GREEN}🧹 一键深度清理...${RESET}"
   echo -e "${YELLOW}⚠️  此操作将清理系统缓存与依赖，仅建议在节点机执行。${RESET}"
   echo -e "${RED}⚠️  非节点机执行可能影响系统或服务，请谨慎确认！${RESET}"
@@ -40,25 +48,38 @@ if [[ -t 0 ]]; then
   fi
 
   echo
-  echo -e "${YELLOW}⚠️  可选：启用【强制模式】=${RESET}"
+  echo -e "${YELLOW}⚠️  【当前执行】可选：启用强制模式${RESET}"
   echo -e "${YELLOW}    1）更激进的内存深度清理（多次 drop_caches 等）${RESET}"
   echo -e "${YELLOW}    2）重启所有非核心 systemd 服务（站点/数据库等统统重启）${RESET}"
   echo -e "${RED}⚠️  敢选“是”就默认你这台机没有重要业务，请自行承担风险。${RESET}"
-  read -rp "是否启用强制模式（强制内存 + 重启所有非核心服务）？[y/N]: " force_mode
+  read -rp "当前执行是否启用强制模式？[y/N]: " force_mode
 
   if [[ "$force_mode" =~ ^[Yy]$ ]]; then
     FORCE_MEM_CLEAN=1
     FORCE_RESTART_SERVICES=1
-    echo -e "${GREEN}✅ 已开启【强制模式】（内存深度清理 + 重启所有非核心服务）。${RESET}"
+    echo -e "${GREEN}✅ 当前执行已开启【强制模式】。${RESET}"
   else
-    FORCE_MEM_CLEAN=0
-    FORCE_RESTART_SERVICES=0
-    echo -e "${YELLOW}ℹ️ 使用普通模式：不重启服务，内存清理相对温和。${RESET}"
+    echo -e "${YELLOW}ℹ️ 当前执行使用【普通模式】。${RESET}"
+  fi
+
+  echo
+  echo -e "${YELLOW}⚠️  【定时任务】设定：脚本每天凌晨 03:00 会自动运行。${RESET}"
+  read -rp "未来的定时任务是否也需要默认启用【强制模式】？[y/N]: " cron_force_mode
+
+  if [[ "$cron_force_mode" =~ ^[Yy]$ ]]; then
+    CRON_CMD_APPEND=" --force"
+    echo -e "${GREEN}✅ 已记录：定时任务将以【强制模式】运行。${RESET}"
+  else
+    CRON_CMD_APPEND=""
+    echo -e "${YELLOW}ℹ️ 已记录：定时任务将以【普通模式】运行。${RESET}"
   fi
 else
-  FORCE_MEM_CLEAN=0
-  FORCE_RESTART_SERVICES=0
-  echo -e "${YELLOW}⚠️ 检测到非交互环境（如 crontab），自动以【普通模式】执行（不强制内存、不重启服务）...${RESET}"
+  # 非交互模式下的逻辑反馈
+  if [[ "${FORCE_MEM_CLEAN}" -eq 1 ]]; then
+    echo -e "${RED}⚠️ 检测到非交互环境且携带 --force 参数，自动以【强制模式】执行！${RESET}"
+  else
+    echo -e "${YELLOW}⚠️ 检测到非交互环境（如 crontab），自动以【普通模式】执行...${RESET}"
+  fi
 fi
 
 # ====== 保护路径（绝不触碰）======
@@ -106,7 +127,6 @@ pkg_purge(){
         rpm_has "$p" && (dnf -y remove "$p" >/dev/null 2>&1 || yum -y remove "$p" >/dev/null 2>&1) || true
         ;;
       *)
-        # 其它系统：跳过
         true
         ;;
     esac
@@ -130,14 +150,12 @@ pkg_install(){
       yum -y install "${pkgs[@]}" >/dev/null 2>&1 || true
       ;;
     *)
-      # 非 apt/dnf/yum：无法统一安装，跳过
       true
       ;;
   esac
 }
 
 ensure_cmd(){
-  # ensure_cmd <cmd> <apt_pkg> <rpm_pkg>
   local cmd="$1" apt_pkg="${2:-}" rpm_pkg="${3:-}"
   if has_cmd "$cmd"; then return 0; fi
   log "检测到缺少命令：$cmd，尝试自动安装..."
@@ -168,7 +186,6 @@ ensure_cron(){
   fi
 }
 
-# systemd-detect-virt 缺失就按“未知/非虚机”处理，避免误删 firmware
 is_vm(){
   if has_cmd systemd-detect-virt; then
     systemd-detect-virt --quiet
@@ -177,7 +194,6 @@ is_vm(){
   fi
 }
 
-# 关键小工具尝试补齐（装不了也不影响主流程）
 ensure_cmd ionice util-linux util-linux
 ensure_cmd sysctl procps procps-ng
 ensure_cmd systemd-detect-virt systemd systemd
@@ -456,13 +472,10 @@ normalize_fstab_to_single(){
   ok "fstab 已规范为单一 /swapfile"
 }
 
-# 探测：是否允许 swapon（很多 NAT/容器会禁止）
 SWAP_SUPPORTED=1
 probe_swap_support(){
   local tmp="/swapfile.__probe__"
-  # 必须是 root 且能写 /swapfile
   [[ "$(id -u)" -eq 0 ]] || return 1
-  # 创建一个最小的 probe swapfile
   rm -f "$tmp" 2>/dev/null || true
   if ! fallocate -l 16M "$tmp" 2>/dev/null; then
     dd if=/dev/zero of="$tmp" bs=1M count=16 status=none conv=fsync 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
@@ -470,7 +483,6 @@ probe_swap_support(){
   chmod 600 "$tmp" 2>/dev/null || true
   mkswap "$tmp" >/dev/null 2>&1 || { rm -f "$tmp" 2>/dev/null || true; return 1; }
 
-  # 关键：尝试 swapon，如果不允许则返回 1
   if swapon "$tmp" >/dev/null 2>&1; then
     swapoff "$tmp" >/dev/null 2>&1 || true
     rm -f "$tmp" 2>/dev/null || true
@@ -581,20 +593,28 @@ df -h / 2>/dev/null | sed 's/^/  /' || true
 free -h 2>/dev/null | sed 's/^/  /' || true
 ok "极简深度清理完成 ✅"
 
-title "⏰ 自动任务" "每日凌晨 03:00 自动运行"
-chmod +x /root/deep-clean.sh
+# 仅当处于交互模式（人类手动执行）时，才去配置/覆盖定时任务
+if [[ -t 0 && "${1:-}" != "--force" ]]; then
+  title "⏰ 自动任务" "配置每日凌晨 03:00 自动运行"
+  chmod +x /root/deep-clean.sh
 
-ensure_cron
-if has_cmd crontab; then
-  ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true
-    echo "0 3 * * * /bin/bash /root/deep-clean.sh >/dev/null 2>&1"
-  ) | crontab -u root -
-  ok "已设置每日 03:00 自动清理"
-else
-  warn "crontab 不可用：已跳过自动任务设置（可手动安装 cron/cronie 后再运行一次脚本）"
+  ensure_cron
+  if has_cmd crontab; then
+    ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true
+      # 根据用户之前的选择，决定是否写入 --force 参数
+      echo "0 3 * * * /bin/bash /root/deep-clean.sh${CRON_CMD_APPEND} >/dev/null 2>&1"
+    ) | crontab -u root -
+    
+    if [[ -n "$CRON_CMD_APPEND" ]]; then
+      ok "已设置每日 03:00 自动清理 (强制模式)"
+    else
+      ok "已设置每日 03:00 自动清理 (普通模式)"
+    fi
+  else
+    warn "crontab 不可用：已跳过自动任务设置（可手动安装 cron/cronie 后再运行一次脚本）"
+  fi
 fi
 EOF
 
 chmod +x "$SCRIPT_PATH"
 bash "$SCRIPT_PATH"
-
