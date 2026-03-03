@@ -13,6 +13,8 @@ cat > "$SCRIPT_PATH" <<'EOF'
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 # ====== 美观输出 ======
 C0="\033[0m"; B="\033[1m"; BLU="\033[38;5;33m"; GRN="\033[38;5;40m"; YEL="\033[38;5;178m"; RED="\033[38;5;196m"; CYA="\033[36m"; GY="\033[90m"
 GREEN="$GRN"; YELLOW="$YEL"; RESET="$C0"
