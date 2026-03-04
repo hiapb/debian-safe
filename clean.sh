@@ -13,7 +13,6 @@ cat > "$SCRIPT_PATH" <<'EOF'
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# 强制注入全局环境变量，破解 Cron 的幽闭沙盒，确保 /sbin 目录下的底层命令可用
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # ====== 美观输出 ======
@@ -66,7 +65,7 @@ if [[ -t 0 && "${1:-}" != "--force" ]]; then
   fi
 
   echo
-  echo -e "${YELLOW}⚠️  【定时任务】设定：脚本每天凌晨 03:00（北京时间）会自动运行。${RESET}"
+  echo -e "${YELLOW}⚠️  【定时任务】设定：脚本每天凌晨 03:00 会自动运行。${RESET}"
   read -rp "未来的定时任务是否也需要默认启用【强制模式】？[y/N]: " cron_force_mode
 
   if [[ "$cron_force_mode" =~ ^[Yy]$ ]]; then
@@ -598,21 +597,20 @@ ok "极简深度清理完成 ✅"
 
 # 仅当处于交互模式（人类手动执行）时，才去配置/覆盖定时任务
 if [[ -t 0 && "${1:-}" != "--force" ]]; then
-  title "⏰ 自动任务" "配置每日凌晨 03:00 (Asia/Shanghai) 自动运行"
+  title "⏰ 自动任务" "配置每日凌晨 03:00 自动运行"
   chmod +x /root/deep-clean.sh
 
   ensure_cron
   if has_cmd crontab; then
-    ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' | grep -v 'CRON_TZ=Asia/Shanghai' || true
-      # 注入时区指令：让随后的 Cron 任务按照东八区时间去触发
-      echo "CRON_TZ=Asia/Shanghai"
+    ( crontab -u root -l 2>/dev/null | grep -v 'deep-clean.sh' || true
+      # 根据用户之前的选择，决定是否写入 --force 参数
       echo "0 3 * * * /bin/bash /root/deep-clean.sh${CRON_CMD_APPEND} >/dev/null 2>&1"
     ) | crontab -u root -
     
     if [[ -n "$CRON_CMD_APPEND" ]]; then
-      ok "已设置每日 03:00 (上海时间) 自动清理 (强制模式)"
+      ok "已设置每日 03:00 自动清理 (强制模式)"
     else
-      ok "已设置每日 03:00 (上海时间) 自动清理 (普通模式)"
+      ok "已设置每日 03:00 自动清理 (普通模式)"
     fi
   else
     warn "crontab 不可用：已跳过自动任务设置（可手动安装 cron/cronie 后再运行一次脚本）"
