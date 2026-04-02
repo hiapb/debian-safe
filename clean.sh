@@ -348,7 +348,8 @@ for base in "${SAFE_BASES[@]}"; do
   [[ -d "$base" ]] || continue
   while IFS= read -r -d '' f; do
     is_excluded "$f" && continue
-    NI "rm -f '$f' 2>/dev/null || true"
+    # 【核心修复】移除 NI 包装，避免几十上百次 bash fork 导致 CPU 瞬间打满，直接静默删除
+    rm -f "$f" 2>/dev/null || true
   done < <(find "$base" -xdev -type f -size +50M -print0 2>/dev/null)
 done
 ok "大文件补充清理完成"
@@ -404,9 +405,10 @@ else
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
   fi
 
-  if [[ -w /proc/sys/vm/compact_memory ]]; then
-    echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
-  fi
+  # 【核心修复】彻底注释掉会导致内核在自旋锁中 100% 假死的内存碎片整理指令
+  # if [[ -w /proc/sys/vm/compact_memory ]]; then
+  #   echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+  # fi
 
   has_cmd sysctl && sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
   ok "内存/CPU 回收完成（模式：$([[ "${FORCE_MEM_CLEAN:-0}" -eq 1 ]] && echo 强制 || echo 普通)）"
@@ -583,7 +585,8 @@ fi
 title "🪶 磁盘优化" "执行 fstrim 提升性能"
 ensure_cmd fstrim util-linux util-linux
 if has_cmd fstrim; then
-  NI "fstrim -av >/dev/null 2>&1 || true"
+  # 【核心修复】增加 120 秒超时阻断机制，防止云硬盘底层拥塞反馈至 CPU 层
+  NI "timeout 120 fstrim -av >/dev/null 2>&1 || true"
   ok "fstrim 完成"
 else
   warn "未检测到 fstrim，已跳过"
